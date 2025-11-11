@@ -235,10 +235,8 @@ mod tests {
                 // Read the string length
                 let len = reader.read::<usize>()?;
                 // Convert the bytes to a string
-                let ptr = reader.as_ptr();
-                let bytes = slice::from_raw_parts(ptr.as_ptr(), len);
+                let bytes = reader.read_slice::<u8>(len)?;
                 let val = str::from_utf8_unchecked(bytes);
-                reader.advance(len)?;
 
                 // Read the timestamp
                 let ts = reader.read::<f64>()?;

@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
+use std::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
 
 pub trait FlatWrite {
     fn write_into(&self, w: &mut FlatWriter) -> Result<(), InsufficientSpace>;
@@ -85,6 +85,20 @@ impl<'buf> FlatReader<'buf> {
             let v = self.start.cast::<T>().read();
             self.start = self.start.add(to_read);
             Ok(v)
+        }
+    }
+
+    pub unsafe fn read_slice<T>(&mut self, len: usize) -> Result<&'buf [T], InsufficientSpace> {
+        self.align_to(align_of::<T>())?;
+        let to_read = size_of::<T>() * len;
+        if self.start.addr().get() + to_read > self.end.addr().get() {
+            return Err(InsufficientSpace);
+        }
+        unsafe {
+            let head = self.start.cast::<T>();
+            let slice = slice::from_raw_parts(head.as_ptr(), len);
+            self.start = self.start.add(to_read);
+            Ok(slice)
         }
     }
 
