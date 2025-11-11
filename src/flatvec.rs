@@ -1,4 +1,10 @@
-use std::{alloc::{self, Layout}, marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
+use std::{
+    alloc::{self, Layout},
+    marker::PhantomData,
+    mem::MaybeUninit,
+    ptr::NonNull,
+    slice,
+};
 
 use crate::{FlatReader, FlatValue, FlatWriter, reader_writer::InsufficientSpace};
 
@@ -106,9 +112,29 @@ impl<T: FlatValue> FlatVec<T> {
         }
     }
 
-    fn first(&self) -> T {
-        let mut reader = FlatReader::from_bytes(dbg!(self.data.as_slice()));
-        T::read_from(&mut reader).unwrap()
+    fn first(&self) -> Option<T> {
+        let mut reader = FlatReader::from_bytes(self.data.as_slice());
+        T::read_from(&mut reader).ok()
+    }
+
+    pub fn iter(&self) -> FlatVecIter<'_, T> {
+        FlatVecIter {
+            reader: FlatReader::from_bytes(self.data.as_slice()),
+            _marker: PhantomData,
+        }
+    }
+}
+
+pub struct FlatVecIter<'buf, T> {
+    reader: FlatReader<'buf>,
+    _marker: PhantomData<T>,
+}
+
+impl<'buf, T: FlatValue> Iterator for FlatVecIter<'buf, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        T::read_from(&mut self.reader).ok()
     }
 }
 
@@ -141,13 +167,33 @@ mod tests {
     #[test]
     fn test_push_and_first() {
         let mut vec = FlatVec::<Point>::new();
-        let point = Point {
-            val: 3.14,
-            ts: 255,
-        };
-        println!("hi");
+        let point = Point { val: 3.14, ts: 255 };
         vec.push(point);
-        let retrieved = vec.first();
+        let retrieved = vec.first().unwrap();
         assert_eq!(retrieved, point);
+    }
+
+    #[test]
+    fn test_iterator() {
+        let mut flatvec = FlatVec::<Point>::new();
+        let points = vec![
+            Point { val: 1.0, ts: 100 },
+            Point { val: 2.0, ts: 200 },
+            Point { val: 3.0, ts: 300 },
+        ];
+
+        for point in &points {
+            flatvec.push(*point);
+        }
+
+        let collected: Vec<Point> = flatvec.iter().collect();
+        assert_eq!(collected, points);
+    }
+
+    #[test]
+    fn test_empty_iterator() {
+        let vec = FlatVec::<Point>::new();
+        let collected: Vec<Point> = vec.iter().collect();
+        assert_eq!(collected.len(), 0);
     }
 }
