@@ -27,7 +27,7 @@ impl<'buf> FlatWriter<'buf> {
         }
     }
 
-    pub fn write<T>(&mut self, v: T) -> Result<(), InsufficientSpace> {
+    pub unsafe fn write<T>(&mut self, v: T) -> Result<(), InsufficientSpace> {
         self.align_to(align_of::<T>())?;
         let to_write = size_of::<T>();
         if self.start.addr().get() + to_write > self.end.addr().get() {

@@ -150,8 +150,10 @@ mod tests {
 
     unsafe impl FlatValue for Point {
         fn write_into(&self, writer: &mut FlatWriter) -> Result<(), InsufficientSpace> {
-            writer.write(self.val)?;
-            writer.write(self.ts)?;
+            unsafe {
+                writer.write(self.val)?;
+                writer.write(self.ts)?;
+            }
             Ok(())
         }
 
