@@ -1,16 +1,89 @@
-use std::{cmp::max, marker::PhantomData};
+use std::{alloc::{self, Layout}, marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
 
 use crate::{FlatReader, FlatValue, FlatWriter, reader_writer::InsufficientSpace};
 
+struct Buf {
+    ptr: NonNull<u8>,
+    len: usize,
+    capacity: usize,
+}
+
+impl Buf {
+    fn new() -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            len: 0,
+            capacity: 0,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.capacity == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        }
+    }
+
+    fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        if self.capacity == 0 {
+            &mut []
+        } else {
+            unsafe {
+                let ptr = self.ptr.as_ptr().add(self.len) as *mut MaybeUninit<u8>;
+                slice::from_raw_parts_mut(ptr, self.capacity - self.len)
+            }
+        }
+    }
+
+    fn double(&mut self) {
+        let new_capacity = if self.capacity == 0 {
+            8
+        } else {
+            self.capacity.checked_mul(2).expect("capacity overflow")
+        };
+
+        let new_layout = Layout::array::<u8>(new_capacity).expect("invalid layout");
+
+        let new_ptr = if self.capacity == 0 {
+            unsafe { alloc::alloc(new_layout) }
+        } else {
+            let old_layout = Layout::array::<u8>(self.capacity).expect("invalid layout");
+            unsafe { alloc::realloc(self.ptr.as_ptr(), old_layout, new_capacity) }
+        };
+
+        self.ptr = NonNull::new(new_ptr).expect("allocation failed");
+        self.capacity = new_capacity;
+    }
+
+    unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.capacity);
+        self.len = new_len;
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for Buf {
+    fn drop(&mut self) {
+        if self.capacity != 0 {
+            let layout = Layout::array::<u8>(self.capacity).expect("invalid layout");
+            unsafe { alloc::dealloc(self.ptr.as_ptr(), layout) }
+        }
+    }
+}
+
 pub struct FlatVec<T> {
-    data: Vec<u8>,
+    data: Buf,
     _marker: PhantomData<T>,
 }
 
 impl<T: FlatValue> FlatVec<T> {
     fn new() -> Self {
         Self {
-            data: Vec::new(),
+            data: Buf::new(),
             _marker: PhantomData,
         }
     }
@@ -21,19 +94,20 @@ impl<T: FlatValue> FlatVec<T> {
             match v.write_into(&mut writer) {
                 Ok(()) => {
                     let write_addr = writer.write_head().addr().get();
-                    let new_len = self.data.as_ptr().addr() - write_addr;
+                    let new_len = write_addr - self.data.as_ptr().addr();
                     unsafe { self.data.set_len(new_len) };
+                    break;
                 }
                 Err(InsufficientSpace) => {
                     println!("growing");
-                    self.data.reserve(max(8, self.data.capacity()));
+                    self.data.double();
                 }
             }
         }
     }
 
     fn first(&self) -> T {
-        let mut reader = FlatReader::from_bytes(self.data.as_slice());
+        let mut reader = FlatReader::from_bytes(dbg!(self.data.as_slice()));
         T::read_from(&mut reader).unwrap()
     }
 }
@@ -69,7 +143,7 @@ mod tests {
         let mut vec = FlatVec::<Point>::new();
         let point = Point {
             val: 3.14,
-            ts: 1234567890,
+            ts: 255,
         };
         println!("hi");
         vec.push(point);

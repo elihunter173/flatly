@@ -30,7 +30,7 @@ impl<'buf> FlatWriter<'buf> {
     pub fn write<T>(&mut self, v: T) -> Result<(), InsufficientSpace> {
         self.align_to(align_of::<T>())?;
         let to_write = size_of::<T>();
-        if self.start.addr().get() + to_write >= self.end.addr().get() {
+        if self.start.addr().get() + to_write > self.end.addr().get() {
             return Err(InsufficientSpace);
         }
         unsafe {
@@ -42,7 +42,7 @@ impl<'buf> FlatWriter<'buf> {
 
     pub fn align_to(&mut self, align: usize) -> Result<(), InsufficientSpace> {
         let offset = self.start.align_offset(align);
-        if self.start.addr().get() + offset >= self.end.addr().get() {
+        if self.start.addr().get() + offset > self.end.addr().get() {
             return Err(InsufficientSpace);
         }
         unsafe {
@@ -74,20 +74,20 @@ impl<'buf> FlatReader<'buf> {
 
     pub unsafe fn read<T>(&mut self) -> Result<T, InsufficientSpace> {
         self.align_to(align_of::<T>())?;
-        let to_write = size_of::<T>();
-        if self.start.addr().get() + to_write >= self.end.addr().get() {
+        let to_read = size_of::<T>();
+        if self.start.addr().get() + to_read > self.end.addr().get() {
             return Err(InsufficientSpace);
         }
         unsafe {
             let v = self.start.cast::<T>().read();
-            self.start = self.start.add(to_write);
+            self.start = self.start.add(to_read);
             Ok(v)
         }
     }
 
     pub fn align_to(&mut self, align: usize) -> Result<(), InsufficientSpace> {
         let offset = self.start.align_offset(align);
-        if self.start.addr().get() + offset >= self.end.addr().get() {
+        if self.start.addr().get() + offset > self.end.addr().get() {
             return Err(InsufficientSpace);
         }
         unsafe {
