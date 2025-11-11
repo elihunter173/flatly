@@ -198,4 +198,75 @@ mod tests {
         let collected: Vec<Point> = vec.iter().collect();
         assert_eq!(collected.len(), 0);
     }
+
+    #[derive(Debug, PartialEq, Clone)]
+    struct Tag {
+        val: String,
+        ts: f64,
+    }
+
+    unsafe impl FlatValue for Tag {
+        fn write_into(&self, writer: &mut FlatWriter) -> Result<(), InsufficientSpace> {
+            unsafe {
+                // Write the string length first
+                writer.write(self.val.len())?;
+
+                // Write the string byte by byte
+                for byte in self.val.bytes() {
+                    writer.write(byte)?;
+                }
+
+                // Write the timestamp
+                writer.write(self.ts)?;
+            }
+            Ok(())
+        }
+
+        fn read_from(reader: &mut FlatReader) -> Result<Self, InsufficientSpace> {
+            unsafe {
+                // Read the string length
+                let len = reader.read::<usize>()?;
+
+                // Read the string bytes
+                let mut bytes = vec![0u8; len];
+                for byte in &mut bytes {
+                    *byte = reader.read::<u8>()?;
+                }
+
+                // Read the timestamp
+                let ts = reader.read::<f64>()?;
+
+                // Convert bytes to String
+                let val = String::from_utf8_unchecked(bytes);
+
+                Ok(Self { val, ts })
+            }
+        }
+    }
+
+    #[test]
+    fn test_tag_with_string() {
+        let mut flatvec = FlatVec::<Tag>::new();
+        let tags = vec![
+            Tag {
+                val: String::from("hello"),
+                ts: 10.0,
+            },
+            Tag {
+                val: String::from("world"),
+                ts: 20.0,
+            },
+            Tag {
+                val: String::from("rust!"),
+                ts: 30.0,
+            },
+        ];
+
+        for tag in &tags {
+            flatvec.push(tag.clone());
+        }
+
+        let collected: Vec<Tag> = flatvec.iter().collect();
+        assert_eq!(collected, tags);
+    }
 }
