@@ -14,6 +14,7 @@ pub struct FlatWriter<'buf> {
 }
 
 // Error impl
+#[derive(Debug)]
 pub struct InsufficientSpace;
 
 impl<'buf> FlatWriter<'buf> {
@@ -27,7 +28,7 @@ impl<'buf> FlatWriter<'buf> {
     }
 
     pub fn write<T>(&mut self, v: T) -> Result<(), InsufficientSpace> {
-        self.align_to(align_of::<T>());
+        self.align_to(align_of::<T>())?;
         let to_write = size_of::<T>();
         if self.start.addr().get() + to_write >= self.end.addr().get() {
             return Err(InsufficientSpace);
@@ -35,8 +36,8 @@ impl<'buf> FlatWriter<'buf> {
         unsafe {
             self.start.cast::<T>().write(v);
             self.start = self.start.add(to_write);
+            Ok(())
         }
-        Ok(())
     }
 
     pub fn align_to(&mut self, align: usize) -> Result<(), InsufficientSpace> {
@@ -49,6 +50,10 @@ impl<'buf> FlatWriter<'buf> {
         }
         Ok(())
     }
+
+    pub(crate) fn write_head(&self) -> NonNull<u8> {
+        self.start
+    }
 }
 
 pub struct FlatReader<'buf> {
@@ -57,23 +62,37 @@ pub struct FlatReader<'buf> {
     _lifetime: PhantomData<&'buf [u8]>,
 }
 
-impl FlatReader<'_> {
-    pub fn read<T>(&mut self) -> T {
-        self.align_to(align_of::<T>());
-        let to_write = size_of::<T>();
-        assert!(self.start.addr().get() + to_write < self.end.addr().get());
-        unsafe {
-            let v = self.start.cast::<T>().read();
-            self.start = self.start.add(to_write);
-            v
+impl<'buf> FlatReader<'buf> {
+    pub(crate) fn from_bytes(bytes: &'buf [u8]) -> Self {
+        let range = bytes.as_ptr_range();
+        Self {
+            start: NonNull::new(range.start.cast_mut().cast::<u8>()).unwrap(),
+            end: NonNull::new(range.end.cast_mut().cast::<u8>()).unwrap(),
+            _lifetime: PhantomData,
         }
     }
 
-    pub fn align_to(&mut self, align: usize) {
+    pub unsafe fn read<T>(&mut self) -> Result<T, InsufficientSpace> {
+        self.align_to(align_of::<T>())?;
+        let to_write = size_of::<T>();
+        if self.start.addr().get() + to_write >= self.end.addr().get() {
+            return Err(InsufficientSpace);
+        }
+        unsafe {
+            let v = self.start.cast::<T>().read();
+            self.start = self.start.add(to_write);
+            Ok(v)
+        }
+    }
+
+    pub fn align_to(&mut self, align: usize) -> Result<(), InsufficientSpace> {
         let offset = self.start.align_offset(align);
-        assert!(self.start.addr().get() + offset < self.end.as_ptr().addr().get());
+        if self.start.addr().get() + offset >= self.end.addr().get() {
+            return Err(InsufficientSpace);
+        }
         unsafe {
             self.start = self.start.add(offset);
         }
+        Ok(())
     }
 }
