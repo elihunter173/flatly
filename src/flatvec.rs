@@ -6,7 +6,7 @@ use std::{
     slice,
 };
 
-use crate::{FlatReader, FlatValue, FlatWriter, reader_writer::InsufficientSpace};
+use crate::{FlatRead, FlatReader, FlatWrite, FlatWriter, reader_writer::InsufficientSpace};
 
 struct Buf {
     ptr: NonNull<u8>,
@@ -86,20 +86,22 @@ pub struct FlatVec<T> {
     _marker: PhantomData<T>,
 }
 
-impl<T: FlatValue> FlatVec<T> {
+impl<T> FlatVec<T> {
     fn new() -> Self {
         Self {
             data: Buf::new(),
             _marker: PhantomData,
         }
     }
+}
 
+impl<T: FlatWrite> FlatVec<T> {
     fn push(&mut self, v: T) {
         loop {
             let mut writer = FlatWriter::from_uninit_bytes(self.data.spare_capacity_mut());
             match v.write_into(&mut writer) {
                 Ok(()) => {
-                    let write_addr = writer.write_head().addr().get();
+                    let write_addr = writer.as_ptr().addr().get();
                     let new_len = write_addr - self.data.as_ptr().addr();
                     unsafe { self.data.set_len(new_len) };
                     break;
@@ -111,13 +113,15 @@ impl<T: FlatValue> FlatVec<T> {
             }
         }
     }
+}
 
-    fn first(&self) -> Option<T> {
+impl<'buf, T: FlatRead<'buf>> FlatVec<T> {
+    fn first(&'buf self) -> Option<T> {
         let mut reader = FlatReader::from_bytes(self.data.as_slice());
         T::read_from(&mut reader).ok()
     }
 
-    pub fn iter(&self) -> FlatVecIter<'_, T> {
+    pub fn iter(&'buf self) -> FlatVecIter<'buf, T> {
         FlatVecIter {
             reader: FlatReader::from_bytes(self.data.as_slice()),
             _marker: PhantomData,
@@ -130,7 +134,7 @@ pub struct FlatVecIter<'buf, T> {
     _marker: PhantomData<T>,
 }
 
-impl<'buf, T: FlatValue> Iterator for FlatVecIter<'buf, T> {
+impl<'buf, T: FlatRead<'buf>> Iterator for FlatVecIter<'buf, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -148,7 +152,7 @@ mod tests {
         ts: u64,
     }
 
-    unsafe impl FlatValue for Point {
+    impl FlatWrite for Point {
         fn write_into(&self, writer: &mut FlatWriter) -> Result<(), InsufficientSpace> {
             unsafe {
                 writer.write(self.val)?;
@@ -156,8 +160,10 @@ mod tests {
             }
             Ok(())
         }
+    }
 
-        fn read_from(reader: &mut FlatReader) -> Result<Self, InsufficientSpace> {
+    impl<'buf> FlatRead<'buf> for Point {
+        fn read_from(reader: &mut FlatReader<'buf>) -> Result<Self, InsufficientSpace> {
             unsafe {
                 let val = reader.read::<f64>()?;
                 let ts = reader.read::<u64>()?;
@@ -200,12 +206,12 @@ mod tests {
     }
 
     #[derive(Debug, PartialEq, Clone)]
-    struct Tag {
-        val: String,
+    struct Tag<'buf> {
+        val: &'buf str,
         ts: f64,
     }
 
-    unsafe impl FlatValue for Tag {
+    impl FlatWrite for Tag<'_> {
         fn write_into(&self, writer: &mut FlatWriter) -> Result<(), InsufficientSpace> {
             unsafe {
                 // Write the string length first
@@ -221,23 +227,21 @@ mod tests {
             }
             Ok(())
         }
+    }
 
-        fn read_from(reader: &mut FlatReader) -> Result<Self, InsufficientSpace> {
+    impl<'buf> FlatRead<'buf> for Tag<'buf> {
+        fn read_from(reader: &mut FlatReader<'buf>) -> Result<Self, InsufficientSpace> {
             unsafe {
                 // Read the string length
                 let len = reader.read::<usize>()?;
-
-                // Read the string bytes
-                let mut bytes = vec![0u8; len];
-                for byte in &mut bytes {
-                    *byte = reader.read::<u8>()?;
-                }
+                // Convert the bytes to a string
+                let ptr = reader.as_ptr();
+                let bytes = slice::from_raw_parts(ptr.as_ptr(), len);
+                let val = str::from_utf8_unchecked(bytes);
+                reader.advance(len)?;
 
                 // Read the timestamp
                 let ts = reader.read::<f64>()?;
-
-                // Convert bytes to String
-                let val = String::from_utf8_unchecked(bytes);
 
                 Ok(Self { val, ts })
             }
@@ -249,15 +253,15 @@ mod tests {
         let mut flatvec = FlatVec::<Tag>::new();
         let tags = vec![
             Tag {
-                val: String::from("hello"),
+                val: "hello",
                 ts: 10.0,
             },
             Tag {
-                val: String::from("world"),
+                val: "world",
                 ts: 20.0,
             },
             Tag {
-                val: String::from("rust!"),
+                val: "rust!",
                 ts: 30.0,
             },
         ];
@@ -266,7 +270,7 @@ mod tests {
             flatvec.push(tag.clone());
         }
 
-        let collected: Vec<Tag> = flatvec.iter().collect();
+        let collected: Vec<_> = flatvec.iter().collect();
         assert_eq!(collected, tags);
     }
 }

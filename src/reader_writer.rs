@@ -1,8 +1,11 @@
 use std::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
-pub unsafe trait FlatValue: Sized {
+pub trait FlatWrite {
     fn write_into(&self, w: &mut FlatWriter) -> Result<(), InsufficientSpace>;
-    fn read_from(r: &mut FlatReader) -> Result<Self, InsufficientSpace>;
+}
+
+pub trait FlatRead<'buf>: Sized {
+    fn read_from(r: &mut FlatReader<'buf>) -> Result<Self, InsufficientSpace>;
 }
 
 // TODO: I think I should have a FlatWriter enum, one that is an "accounting" writer and one that
@@ -51,7 +54,7 @@ impl<'buf> FlatWriter<'buf> {
         Ok(())
     }
 
-    pub(crate) fn write_head(&self) -> NonNull<u8> {
+    pub(crate) fn as_ptr(&self) -> NonNull<u8> {
         self.start
     }
 }
@@ -86,7 +89,10 @@ impl<'buf> FlatReader<'buf> {
     }
 
     pub fn align_to(&mut self, align: usize) -> Result<(), InsufficientSpace> {
-        let offset = self.start.align_offset(align);
+        self.advance(self.start.align_offset(align))
+    }
+
+    pub fn advance(&mut self, offset: usize) -> Result<(), InsufficientSpace> {
         if self.start.addr().get() + offset > self.end.addr().get() {
             return Err(InsufficientSpace);
         }
@@ -94,5 +100,9 @@ impl<'buf> FlatReader<'buf> {
             self.start = self.start.add(offset);
         }
         Ok(())
+    }
+
+    pub(crate) fn as_ptr(&self) -> NonNull<u8> {
+        self.start
     }
 }
