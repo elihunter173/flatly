@@ -1,50 +1,59 @@
-use std::{marker::PhantomData, mem::MaybeUninit};
+use std::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
-pub unsafe trait FlatValue {
-    fn write_into(self, w: &mut FlatWriter);
-    fn read_from(self, r: &mut FlatReader);
+pub unsafe trait FlatValue: Sized {
+    fn write_into(&self, w: &mut FlatWriter) -> Result<(), InsufficientSpace>;
+    fn read_from(r: &mut FlatReader) -> Result<Self, InsufficientSpace>;
 }
 
 // TODO: I think I should have a FlatWriter enum, one that is an "accounting" writer and one that
 // is the actual writer
 pub struct FlatWriter<'buf> {
-    start: *mut u8,
-    end: *mut u8,
+    start: NonNull<u8>,
+    end: NonNull<u8>,
     _lifetime: PhantomData<&'buf [u8]>,
 }
+
+// Error impl
+pub struct InsufficientSpace;
 
 impl<'buf> FlatWriter<'buf> {
     pub(crate) fn from_uninit_bytes(bytes: &'buf mut [MaybeUninit<u8>]) -> Self {
         let range = bytes.as_mut_ptr_range();
         Self {
-            start: range.start.cast::<u8>(),
-            end: range.end.cast::<u8>(),
+            start: NonNull::new(range.start.cast::<u8>()).unwrap(),
+            end: NonNull::new(range.end.cast::<u8>()).unwrap(),
             _lifetime: PhantomData,
         }
     }
 
-    pub fn write<T>(&mut self, v: T) {
+    pub fn write<T>(&mut self, v: T) -> Result<(), InsufficientSpace> {
         self.align_to(align_of::<T>());
         let to_write = size_of::<T>();
-        assert!(self.start.addr() + to_write < self.end.addr());
+        if self.start.addr().get() + to_write >= self.end.addr().get() {
+            return Err(InsufficientSpace);
+        }
         unsafe {
             self.start.cast::<T>().write(v);
             self.start = self.start.add(to_write);
         }
+        Ok(())
     }
 
-    pub fn align_to(&mut self, align: usize) {
+    pub fn align_to(&mut self, align: usize) -> Result<(), InsufficientSpace> {
         let offset = self.start.align_offset(align);
-        assert!(self.start.addr() + offset < self.end.addr());
+        if self.start.addr().get() + offset >= self.end.addr().get() {
+            return Err(InsufficientSpace);
+        }
         unsafe {
             self.start = self.start.add(offset);
         }
+        Ok(())
     }
 }
 
 pub struct FlatReader<'buf> {
-    start: *const u8,
-    end: *const u8,
+    start: NonNull<u8>,
+    end: NonNull<u8>,
     _lifetime: PhantomData<&'buf [u8]>,
 }
 
@@ -52,7 +61,7 @@ impl FlatReader<'_> {
     pub fn read<T>(&mut self) -> T {
         self.align_to(align_of::<T>());
         let to_write = size_of::<T>();
-        assert!(self.start.addr() + to_write < self.end.addr());
+        assert!(self.start.addr().get() + to_write < self.end.addr().get());
         unsafe {
             let v = self.start.cast::<T>().read();
             self.start = self.start.add(to_write);
@@ -62,7 +71,7 @@ impl FlatReader<'_> {
 
     pub fn align_to(&mut self, align: usize) {
         let offset = self.start.align_offset(align);
-        assert!(self.start.addr() + offset < self.end.addr());
+        assert!(self.start.addr().get() + offset < self.end.as_ptr().addr().get());
         unsafe {
             self.start = self.start.add(offset);
         }
