@@ -10,7 +10,7 @@ use std::{
     slice,
 };
 
-use crate::{FlatRead, FlatReader, FlatWrite, FlatWriter, reader_writer::InsufficientSpace};
+use crate::visitor::{FlatError, FlatVisitor, ReadVisitor, WriteVisitor};
 
 /// A manually managed, growable byte buffer with no alignment guarantees.
 ///
@@ -114,10 +114,13 @@ impl Drop for Buf {
     }
 }
 
+pub unsafe trait FlatVecValue<'buf> {
+    unsafe fn visit<V: FlatVisitor<'buf>>(place: *mut Self, v: &mut V) -> Result<(), FlatError>;
+}
+
 /// A Vec-like data structure that stores stores elements in a flat array.
 ///
-/// Elements are inserted via their [`FlatWrite`] implementation and read via their [`FlatRead`]
-/// implmentation.
+/// Elements are written and read back via their [`FlatVecValue`] implementation.
 ///
 /// Because elements can be variable sized, there is no random access by index.
 pub struct FlatVec<T> {
@@ -142,35 +145,37 @@ impl<T> Default for FlatVec<T> {
     }
 }
 
-impl<T: FlatWrite> FlatVec<T> {
+impl<'buf, T: FlatVecValue<'buf>> FlatVec<T> {
     /// Appends `v` to the back of `FlatVec`. If item doesn't fit, the buffer size is doubled.
     ///
     /// # Panics
     ///
-    /// Panics if growing the buffer fails.
+    /// Panics if growing the buffer fails, or if a slice in `v` is too long for the length type
+    /// its [`FlatVecValue`] impl stores it with.
     pub fn push(&mut self, v: T) {
         loop {
-            let mut writer = FlatWriter::from_uninit_bytes(self.data.spare_capacity_mut());
-            match v.write_into(&mut writer) {
+            let mut writer = WriteVisitor::from_uninit_bytes(self.data.spare_capacity_mut());
+            // SAFETY: `v` is a live, initialized `T`; the write visitor only reads through it.
+            match unsafe { T::visit((&raw const v).cast_mut(), &mut writer) } {
                 Ok(()) => {
                     let write_addr = writer.as_ptr().addr().get();
                     let new_len = write_addr - self.data.as_ptr().addr();
                     unsafe { self.data.set_len(new_len) };
                     break;
                 }
-                Err(InsufficientSpace) => {
+                Err(FlatError::InsufficientSpace) => {
                     self.data.double();
+                }
+                Err(FlatError::LenOverflow) => {
+                    panic!("slice length doesn't fit in its stored length type");
                 }
             }
         }
     }
-}
 
-impl<'buf, T: FlatRead<'buf>> FlatVec<T> {
     /// Returns the first element, or `None` if the vector is empty.
     pub fn first(&'buf self) -> Option<T> {
-        let mut reader = FlatReader::from_bytes(self.data.as_slice());
-        T::read_from(&mut reader).ok()
+        ReadVisitor::from_bytes(self.data.as_slice()).read().ok()
     }
 
     /// Returns an iterator over the `FlatVec`.
@@ -178,7 +183,7 @@ impl<'buf, T: FlatRead<'buf>> FlatVec<T> {
     /// The iterator yields all elements in insertion order.
     pub fn iter(&'buf self) -> FlatVecIter<'buf, T> {
         FlatVecIter {
-            reader: FlatReader::from_bytes(self.data.as_slice()),
+            reader: ReadVisitor::from_bytes(self.data.as_slice()),
             _marker: PhantomData,
         }
     }
@@ -190,15 +195,15 @@ impl<'buf, T: FlatRead<'buf>> FlatVec<T> {
 pub struct FlatVecIter<'buf, T> {
     /// Cursor over the vector's in-use bytes, positioned at the start of the
     /// next element to decode.
-    reader: FlatReader<'buf>,
+    reader: ReadVisitor<'buf>,
     _marker: PhantomData<T>,
 }
 
-impl<'buf, T: FlatRead<'buf>> Iterator for FlatVecIter<'buf, T> {
+impl<'buf, T: FlatVecValue<'buf>> Iterator for FlatVecIter<'buf, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        T::read_from(&mut self.reader).ok()
+        self.reader.read().ok()
     }
 }
 
@@ -213,23 +218,16 @@ mod tests {
         ts: u64,
     }
 
-    impl FlatWrite for Point {
-        fn write_into(&self, writer: &mut FlatWriter) -> Result<(), InsufficientSpace> {
+    unsafe impl<'buf> FlatVecValue<'buf> for Point {
+        unsafe fn visit<V: FlatVisitor<'buf>>(
+            place: *mut Self,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
             unsafe {
-                writer.write(self.val)?;
-                writer.write(self.ts)?;
+                v.scalar(&raw mut (*place).val)?;
+                v.scalar(&raw mut (*place).ts)?;
             }
             Ok(())
-        }
-    }
-
-    impl<'buf> FlatRead<'buf> for Point {
-        fn read_from(reader: &mut FlatReader<'buf>) -> Result<Self, InsufficientSpace> {
-            unsafe {
-                let val = reader.read::<f64>()?;
-                let ts = reader.read::<u64>()?;
-                Ok(Self { val, ts })
-            }
         }
     }
 
@@ -273,38 +271,19 @@ mod tests {
         ts: f64,
     }
 
-    impl FlatWrite for Tag<'_> {
-        fn write_into(&self, writer: &mut FlatWriter) -> Result<(), InsufficientSpace> {
+    unsafe impl<'buf> FlatVecValue<'buf> for Tag<'buf> {
+        unsafe fn visit<V: FlatVisitor<'buf>>(
+            place: *mut Self,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
             unsafe {
-                // Write the string length first
-                writer.write(self.val.len())?;
-
-                // Write the string byte by byte
-                for byte in self.val.bytes() {
-                    writer.write(byte)?;
-                }
-
-                // Write the timestamp
-                writer.write(self.ts)?;
+                // `&str` has the same layout as `&[u8]`.
+                let val = (&raw mut (*place).val).cast::<&'buf [u8]>();
+                let len = v.slice_len::<u32, _>(val)?;
+                v.slice_data(val, len)?;
+                v.scalar(&raw mut (*place).ts)?;
             }
             Ok(())
-        }
-    }
-
-    impl<'buf> FlatRead<'buf> for Tag<'buf> {
-        fn read_from(reader: &mut FlatReader<'buf>) -> Result<Self, InsufficientSpace> {
-            unsafe {
-                // Read the string length
-                let len = reader.read::<usize>()?;
-                // Convert the bytes to a string
-                let bytes = reader.read_slice::<u8>(len)?;
-                let val = str::from_utf8_unchecked(bytes);
-
-                // Read the timestamp
-                let ts = reader.read::<f64>()?;
-
-                Ok(Self { val, ts })
-            }
         }
     }
 
@@ -332,5 +311,64 @@ mod tests {
 
         let collected: Vec<_> = flatvec.iter().collect();
         assert_eq!(collected, tags);
+    }
+
+    /// Slices of non-byte elements, plus a nested value.
+    #[derive(Debug, PartialEq, Clone)]
+    struct Series<'buf> {
+        name: Tag<'buf>,
+        points: &'buf [Point],
+        flag: u8,
+    }
+
+    unsafe impl<'buf> FlatVecValue<'buf> for Series<'buf> {
+        unsafe fn visit<V: FlatVisitor<'buf>>(
+            place: *mut Self,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
+            unsafe {
+                v.nested(&raw mut (*place).name)?;
+
+                let points = &raw mut (*place).points;
+                let len = v.slice_len::<u16, _>(points)?;
+                v.slice_data(points, len)?;
+
+                v.scalar(&raw mut (*place).flag)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_series_with_slices() {
+        let pts = [Point { val: 1.0, ts: 1 }, Point { val: 2.0, ts: 2 }];
+        let series = vec![
+            Series {
+                name: Tag { val: "a", ts: 0.5 },
+                points: &pts,
+                flag: 1,
+            },
+            Series {
+                name: Tag { val: "", ts: 1.5 },
+                points: &[],
+                flag: 2,
+            },
+            Series {
+                name: Tag {
+                    val: "a much longer name to force growth",
+                    ts: 2.5,
+                },
+                points: &pts[1..],
+                flag: 3,
+            },
+        ];
+
+        let mut flatvec = FlatVec::<Series>::new();
+        for s in &series {
+            flatvec.push(s.clone());
+        }
+
+        let collected: Vec<_> = flatvec.iter().collect();
+        assert_eq!(collected, series);
     }
 }

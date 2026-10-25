@@ -5,8 +5,5 @@
 //! This makes it possible to store variable-sized records, as a string, with no per-element heap
 //! allocation. Decoded values can also borrow directly from the buffer (for example `&'buf str`).
 
-mod flatvec;
-mod reader_writer;
-
-pub use flatvec::{FlatVec, FlatVecIter};
-pub use reader_writer::{FlatRead, FlatReader, FlatWrite, FlatWriter, InsufficientSpace};
+pub mod flatvec;
+pub mod visitor;
