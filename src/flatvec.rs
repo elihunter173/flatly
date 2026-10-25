@@ -1,3 +1,7 @@
+//! [`FlatVec`] is a Vec-like data structure that stores elements in a flat array.
+//!
+//! This means all variable sized data gets written in a flat buffer.
+
 use std::{
     alloc::{self, Layout},
     marker::PhantomData,
@@ -8,13 +12,25 @@ use std::{
 
 use crate::{FlatRead, FlatReader, FlatWrite, FlatWriter, reader_writer::InsufficientSpace};
 
+/// A manually managed, growable byte buffer with no alignment guarantees.
+///
+///
+/// # Invariants
+///
+/// - `len <= capacity`.
+/// - If `capacity == 0`, `ptr` is dangling. Otherwise, it points to a live allocation.
+/// - Bytes `0..len` are in use and `len..capacity` are uninitialized.
 struct Buf {
+    /// Start of the allocation, or [`NonNull::dangling`] when `capacity == 0`.
     ptr: NonNull<u8>,
+    /// Number of bytes at the start of the buffer are initialized.
     len: usize,
+    /// Total size of the allocation in bytes.
     capacity: usize,
 }
 
 impl Buf {
+    /// Creates an empty buffer without allocating.
     fn new() -> Self {
         Self {
             ptr: NonNull::dangling(),
@@ -23,6 +39,7 @@ impl Buf {
         }
     }
 
+    /// Returns the initialized bytes (`0..len`) as a slice.
     fn as_slice(&self) -> &[u8] {
         if self.capacity == 0 {
             &[]
@@ -31,6 +48,7 @@ impl Buf {
         }
     }
 
+    /// Returns the tail of uninitialized bytes at the end of Buf's allocation.
     fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         if self.capacity == 0 {
             &mut []
@@ -42,6 +60,12 @@ impl Buf {
         }
     }
 
+    /// Grows the allocation to 8 bytes if nothing has been allocated yet,
+    /// otherwise to twice the current capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity overflows `usize` or if the allocator returns null.
     fn double(&mut self) {
         let new_capacity = if self.capacity == 0 {
             8
@@ -54,6 +78,7 @@ impl Buf {
         let new_ptr = if self.capacity == 0 {
             unsafe { alloc::alloc(new_layout) }
         } else {
+            // TODO: Realloc needs to preserve the alignment of the current buffer.
             let old_layout = Layout::array::<u8>(self.capacity).expect("invalid layout");
             unsafe { alloc::realloc(self.ptr.as_ptr(), old_layout, new_capacity) }
         };
@@ -62,17 +87,25 @@ impl Buf {
         self.capacity = new_capacity;
     }
 
+    /// Sets the number of in-use bytes to `new_len`.
+    ///
+    /// # Safety
+    ///
+    /// `new_len` must be `<= capacity`, and bytes `0..new_len` must be initialized.
     unsafe fn set_len(&mut self, new_len: usize) {
         debug_assert!(new_len <= self.capacity);
         self.len = new_len;
     }
 
+    /// Returns the raw base pointer of the buffer. This pointer is dangling
+    /// when nothing has been allocated.
     fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }
 }
 
 impl Drop for Buf {
+    /// Frees the allocation, if there is one.
     fn drop(&mut self) {
         if self.capacity != 0 {
             let layout = Layout::array::<u8>(self.capacity).expect("invalid layout");
@@ -81,13 +114,21 @@ impl Drop for Buf {
     }
 }
 
+/// A Vec-like data structure that stores stores elements in a flat array.
+///
+/// Elements are inserted via their [`FlatWrite`] implementation and read via their [`FlatRead`]
+/// implmentation.
+///
+/// Because elements can be variable sized, there is no random access by index.
 pub struct FlatVec<T> {
+    /// Storage for all elements stored back to back.
     data: Buf,
     _marker: PhantomData<T>,
 }
 
 impl<T> FlatVec<T> {
-    fn new() -> Self {
+    /// Creates an empty `FlatVec` without allocating.
+    pub fn new() -> Self {
         Self {
             data: Buf::new(),
             _marker: PhantomData,
@@ -95,8 +136,19 @@ impl<T> FlatVec<T> {
     }
 }
 
+impl<T> Default for FlatVec<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: FlatWrite> FlatVec<T> {
-    fn push(&mut self, v: T) {
+    /// Appends `v` to the back of `FlatVec`. If item doesn't fit, the buffer size is doubled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if growing the buffer fails.
+    pub fn push(&mut self, v: T) {
         loop {
             let mut writer = FlatWriter::from_uninit_bytes(self.data.spare_capacity_mut());
             match v.write_into(&mut writer) {
@@ -107,7 +159,6 @@ impl<T: FlatWrite> FlatVec<T> {
                     break;
                 }
                 Err(InsufficientSpace) => {
-                    println!("growing");
                     self.data.double();
                 }
             }
@@ -116,11 +167,15 @@ impl<T: FlatWrite> FlatVec<T> {
 }
 
 impl<'buf, T: FlatRead<'buf>> FlatVec<T> {
-    fn first(&'buf self) -> Option<T> {
+    /// Returns the first element, or `None` if the vector is empty.
+    pub fn first(&'buf self) -> Option<T> {
         let mut reader = FlatReader::from_bytes(self.data.as_slice());
         T::read_from(&mut reader).ok()
     }
 
+    /// Returns an iterator over the `FlatVec`.
+    ///
+    /// The iterator yields all elements in insertion order.
     pub fn iter(&'buf self) -> FlatVecIter<'buf, T> {
         FlatVecIter {
             reader: FlatReader::from_bytes(self.data.as_slice()),
@@ -129,7 +184,12 @@ impl<'buf, T: FlatRead<'buf>> FlatVec<T> {
     }
 }
 
+/// Iterator over the elements of a [`FlatVec`].
+///
+/// Returned by [`FlatVec::iter`].
 pub struct FlatVecIter<'buf, T> {
+    /// Cursor over the vector's in-use bytes, positioned at the start of the
+    /// next element to decode.
     reader: FlatReader<'buf>,
     _marker: PhantomData<T>,
 }
@@ -146,6 +206,7 @@ impl<'buf, T: FlatRead<'buf>> Iterator for FlatVecIter<'buf, T> {
 mod tests {
     use super::*;
 
+    /// fixed-sized example
     #[derive(Debug, Clone, Copy, PartialEq)]
     struct Point {
         val: f64,
@@ -205,6 +266,7 @@ mod tests {
         assert_eq!(collected.len(), 0);
     }
 
+    /// variable-sized example
     #[derive(Debug, PartialEq, Clone)]
     struct Tag<'buf> {
         val: &'buf str,
