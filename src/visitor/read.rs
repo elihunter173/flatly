@@ -1,7 +1,6 @@
 use std::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
 
 use super::{FlatError, FlatLen, FlatVisitor};
-use crate::flatvec::FlatVecValue;
 
 pub struct ReadVisitor<'buf> {
     start: NonNull<u8>,
@@ -16,17 +15,6 @@ impl<'buf> ReadVisitor<'buf> {
             start: NonNull::new(range.start.cast_mut()).unwrap(),
             end: NonNull::new(range.end.cast_mut()).unwrap(),
             _lifetime: PhantomData,
-        }
-    }
-
-    pub(crate) fn read<T: FlatVecValue<'buf>>(&mut self) -> Result<T, FlatError> {
-        let mut out = MaybeUninit::<T>::uninit();
-        // SAFETY: `out` is valid for writes; the `FlatVecValue` contract guarantees every field is
-        // initialized on success. On error `out` is dropped as `MaybeUninit`, so nothing leaks
-        // or double-drops.
-        unsafe {
-            T::visit(out.as_mut_ptr(), self)?;
-            Ok(out.assume_init())
         }
     }
 
@@ -48,16 +36,13 @@ impl<'buf> ReadVisitor<'buf> {
     }
 }
 
-impl<'buf> FlatVisitor<'buf> for ReadVisitor<'buf> {
+impl<'buf> FlatVisitor for ReadVisitor<'buf> {
     unsafe fn scalar<T: Copy>(&mut self, place: *mut T) -> Result<(), FlatError> {
         unsafe { place.write(self.take_array::<T>(1)?.read()) };
         Ok(())
     }
 
-    unsafe fn slice_len<L: FlatLen, T>(
-        &mut self,
-        _place: *mut &'buf [T],
-    ) -> Result<usize, FlatError> {
+    unsafe fn slice_len<L: FlatLen, T>(&mut self, _place: *mut &[T]) -> Result<usize, FlatError> {
         let mut stored = MaybeUninit::<L>::uninit();
         unsafe {
             self.scalar(stored.as_mut_ptr())?;
@@ -70,7 +55,7 @@ impl<'buf> FlatVisitor<'buf> for ReadVisitor<'buf> {
 
     unsafe fn slice_data<T: Copy>(
         &mut self,
-        place: *mut &'buf [T],
+        place: *mut &[T],
         len: usize,
     ) -> Result<(), FlatError> {
         unsafe {

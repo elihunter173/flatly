@@ -1,34 +1,21 @@
+mod align;
 mod read;
 mod write;
 
 #[cfg(test)]
 mod tests;
 
+pub use align::AlignOfVisitor;
 pub use read::ReadVisitor;
 pub use write::WriteVisitor;
 
-use crate::flatvec::FlatVecValue;
-
-pub trait FlatVisitor<'buf> {
+pub trait FlatVisitor {
     unsafe fn scalar<T: Copy>(&mut self, place: *mut T) -> Result<(), FlatError>;
 
-    unsafe fn slice_len<L: FlatLen, T>(
-        &mut self,
-        place: *mut &'buf [T],
-    ) -> Result<usize, FlatError>;
+    unsafe fn slice_len<L: FlatLen, T>(&mut self, place: *mut &[T]) -> Result<usize, FlatError>;
 
-    unsafe fn slice_data<T: Copy>(
-        &mut self,
-        place: *mut &'buf [T],
-        len: usize,
-    ) -> Result<(), FlatError>;
-
-    unsafe fn nested<T: FlatVecValue<'buf>>(&mut self, place: *mut T) -> Result<(), FlatError>
-    where
-        Self: Sized,
-    {
-        unsafe { T::visit(place, self) }
-    }
+    unsafe fn slice_data<T: Copy>(&mut self, place: *mut &[T], len: usize)
+    -> Result<(), FlatError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

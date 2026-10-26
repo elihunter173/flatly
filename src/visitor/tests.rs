@@ -2,6 +2,9 @@ use std::{mem::MaybeUninit, slice};
 
 use super::*;
 
+#[repr(align(8))]
+struct AlignedBytes<const N: usize>([MaybeUninit<u8>; N]);
+
 #[derive(Debug, Clone, PartialEq)]
 struct Row<'buf> {
     name: &'buf str,
@@ -9,7 +12,7 @@ struct Row<'buf> {
     ts: u64,
 }
 
-unsafe fn visit_split<'buf, L: FlatVisitor<'buf>, D: FlatVisitor<'buf>>(
+unsafe fn visit_split<'buf, L: FlatVisitor, D: FlatVisitor>(
     place: *mut Row<'buf>,
     lens: &mut L,
     data: &mut D,
@@ -44,20 +47,23 @@ fn test_len_and_data_in_separate_visitors() {
         },
     ];
 
-    let mut lens_buf = [MaybeUninit::<u8>::uninit(); 64];
-    let mut data_buf = [MaybeUninit::<u8>::uninit(); 256];
+    let mut lens_buf = AlignedBytes([MaybeUninit::<u8>::uninit(); 64]);
+    let mut data_buf = AlignedBytes([MaybeUninit::<u8>::uninit(); 256]);
     let (lens_bytes, data_bytes) = {
-        let mut lens = WriteVisitor::from_uninit_bytes(&mut lens_buf);
-        let mut data = WriteVisitor::from_uninit_bytes(&mut data_buf);
+        let mut lens = WriteVisitor::from_uninit_bytes(&mut lens_buf.0);
+        let mut data = WriteVisitor::from_uninit_bytes(&mut data_buf.0);
         for row in &rows {
             let mut row = row.clone();
             unsafe { visit_split(&raw mut row, &mut lens, &mut data).unwrap() };
         }
         let (l, d) = (lens.as_ptr().addr().get(), data.as_ptr().addr().get());
-        (l - lens_buf.as_ptr().addr(), d - data_buf.as_ptr().addr())
+        (
+            l - lens_buf.0.as_ptr().addr(),
+            d - data_buf.0.as_ptr().addr(),
+        )
     };
-    let lens_bytes = unsafe { slice::from_raw_parts(lens_buf.as_ptr().cast::<u8>(), lens_bytes) };
-    let data_bytes = unsafe { slice::from_raw_parts(data_buf.as_ptr().cast::<u8>(), data_bytes) };
+    let lens_bytes = unsafe { slice::from_raw_parts(lens_buf.0.as_ptr().cast::<u8>(), lens_bytes) };
+    let data_bytes = unsafe { slice::from_raw_parts(data_buf.0.as_ptr().cast::<u8>(), data_bytes) };
 
     // Lengths column is exactly (u8 name_len, pad, u16 values_len) per row.
     assert_eq!(lens_bytes.len(), 3 * 4);

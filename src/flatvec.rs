@@ -10,32 +10,74 @@ use std::{
     slice,
 };
 
-use crate::visitor::{FlatError, FlatVisitor, ReadVisitor, WriteVisitor};
+use crate::visitor::{AlignOfVisitor, FlatError, FlatVisitor, ReadVisitor, WriteVisitor};
 
-/// A manually managed, growable byte buffer with no alignment guarantees.
+pub unsafe trait FlatVecValue {
+    const ALIGN: usize;
+
+    /// Visits every field in the encoded representation without reading from `place` directly.
+    ///
+    /// Implementations may form raw pointers to fields and pass them to the visitor, but must not
+    /// dereference `place` themselves.
+    unsafe fn visit<V: FlatVisitor>(place: *mut Self, v: &mut V) -> Result<(), FlatError>;
+}
+
+pub(crate) fn read_from<T: FlatVecValue>(visitor: &mut ReadVisitor) -> Result<T, FlatError> {
+    let mut out = MaybeUninit::<T>::uninit();
+    // SAFETY: `out` is valid for writes; the `FlatVecValue` contract guarantees every field is
+    // initialized on success. On error `out` is dropped as `MaybeUninit`, so nothing leaks
+    // or double-drops.
+    unsafe {
+        T::visit(out.as_mut_ptr(), visitor)?;
+        Ok(out.assume_init())
+    }
+}
+
+/// A Vec-like data structure that stores stores elements in a flat array.
 ///
+/// Elements are written and read back via their [`FlatVecValue`] implementation.
+///
+/// Because elements can be variable sized, there is no random access by index.
 ///
 /// # Invariants
 ///
 /// - `len <= capacity`.
 /// - If `capacity == 0`, `ptr` is dangling. Otherwise, it points to a live allocation.
 /// - Bytes `0..len` are in use and `len..capacity` are uninitialized.
-struct Buf {
+pub struct FlatVec<T: FlatVecValue> {
     /// Start of the allocation, or [`NonNull::dangling`] when `capacity == 0`.
     ptr: NonNull<u8>,
     /// Number of bytes at the start of the buffer are initialized.
     len: usize,
     /// Total size of the allocation in bytes.
     capacity: usize,
+    _marker: PhantomData<T>,
 }
 
-impl Buf {
-    /// Creates an empty buffer without allocating.
-    fn new() -> Self {
+impl<T: FlatVecValue> Default for FlatVec<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: FlatVecValue> Drop for FlatVec<T> {
+    /// Frees the allocation, if there is one.
+    fn drop(&mut self) {
+        if self.capacity != 0 {
+            let layout = Layout::from_size_align(self.capacity, T::ALIGN).expect("invalid layout");
+            unsafe { alloc::dealloc(self.ptr.as_ptr(), layout) }
+        }
+    }
+}
+
+impl<T: FlatVecValue> FlatVec<T> {
+    /// Creates an empty `FlatVec` without allocating.
+    pub fn new() -> Self {
         Self {
             ptr: NonNull::dangling(),
             len: 0,
             capacity: 0,
+            _marker: PhantomData,
         }
     }
 
@@ -73,13 +115,14 @@ impl Buf {
             self.capacity.checked_mul(2).expect("capacity overflow")
         };
 
-        let new_layout = Layout::array::<u8>(new_capacity).expect("invalid layout");
+        let new_layout = Layout::from_size_align(new_capacity, T::ALIGN).expect("invalid layout");
 
         let new_ptr = if self.capacity == 0 {
             unsafe { alloc::alloc(new_layout) }
         } else {
             // TODO: Realloc needs to preserve the alignment of the current buffer.
-            let old_layout = Layout::array::<u8>(self.capacity).expect("invalid layout");
+            let old_layout =
+                Layout::from_size_align(self.capacity, T::ALIGN).expect("invalid layout");
             unsafe { alloc::realloc(self.ptr.as_ptr(), old_layout, new_capacity) }
         };
 
@@ -97,74 +140,35 @@ impl Buf {
         self.len = new_len;
     }
 
-    /// Returns the raw base pointer of the buffer. This pointer is dangling
-    /// when nothing has been allocated.
-    fn as_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
-    }
-}
-
-impl Drop for Buf {
-    /// Frees the allocation, if there is one.
-    fn drop(&mut self) {
-        if self.capacity != 0 {
-            let layout = Layout::array::<u8>(self.capacity).expect("invalid layout");
-            unsafe { alloc::dealloc(self.ptr.as_ptr(), layout) }
-        }
-    }
-}
-
-pub unsafe trait FlatVecValue<'buf> {
-    unsafe fn visit<V: FlatVisitor<'buf>>(place: *mut Self, v: &mut V) -> Result<(), FlatError>;
-}
-
-/// A Vec-like data structure that stores stores elements in a flat array.
-///
-/// Elements are written and read back via their [`FlatVecValue`] implementation.
-///
-/// Because elements can be variable sized, there is no random access by index.
-pub struct FlatVec<T> {
-    /// Storage for all elements stored back to back.
-    data: Buf,
-    _marker: PhantomData<T>,
-}
-
-impl<T> FlatVec<T> {
-    /// Creates an empty `FlatVec` without allocating.
-    pub fn new() -> Self {
-        Self {
-            data: Buf::new(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<T> Default for FlatVec<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<'buf, T: FlatVecValue<'buf>> FlatVec<T> {
     /// Appends `v` to the back of `FlatVec`. If item doesn't fit, the buffer size is doubled.
     ///
     /// # Panics
     ///
     /// Panics if growing the buffer fails, or if a slice in `v` is too long for the length type
     /// its [`FlatVecValue`] impl stores it with.
-    pub fn push(&mut self, v: T) {
+    pub fn push(&mut self, mut v: T) {
+        // Ensure T::ALIGN is right
+        if cfg!(debug_assertions) {
+            let mut align_visitor = AlignOfVisitor::new();
+            unsafe {
+                T::visit(&raw mut v, &mut align_visitor)
+                    .expect("align of visitor never returns errors")
+            };
+            assert_eq!(T::ALIGN, align_visitor.alignment());
+        }
+
         loop {
-            let mut writer = WriteVisitor::from_uninit_bytes(self.data.spare_capacity_mut());
+            let mut writer = WriteVisitor::from_uninit_bytes(self.spare_capacity_mut());
             // SAFETY: `v` is a live, initialized `T`; the write visitor only reads through it.
-            match unsafe { T::visit((&raw const v).cast_mut(), &mut writer) } {
+            match unsafe { T::visit(&raw mut v, &mut writer) } {
                 Ok(()) => {
                     let write_addr = writer.as_ptr().addr().get();
-                    let new_len = write_addr - self.data.as_ptr().addr();
-                    unsafe { self.data.set_len(new_len) };
+                    let new_len = write_addr - self.ptr.as_ptr().addr();
+                    unsafe { self.set_len(new_len) };
                     break;
                 }
                 Err(FlatError::InsufficientSpace) => {
-                    self.data.double();
+                    self.double();
                 }
                 Err(FlatError::LenOverflow) => {
                     panic!("slice length doesn't fit in its stored length type");
@@ -174,16 +178,17 @@ impl<'buf, T: FlatVecValue<'buf>> FlatVec<T> {
     }
 
     /// Returns the first element, or `None` if the vector is empty.
-    pub fn first(&'buf self) -> Option<T> {
-        ReadVisitor::from_bytes(self.data.as_slice()).read().ok()
+    pub fn first(&self) -> Option<T> {
+        let mut visitor = ReadVisitor::from_bytes(self.as_slice());
+        read_from(&mut visitor).ok()
     }
 
     /// Returns an iterator over the `FlatVec`.
     ///
     /// The iterator yields all elements in insertion order.
-    pub fn iter(&'buf self) -> FlatVecIter<'buf, T> {
+    pub fn iter(&self) -> FlatVecIter<'_, T> {
         FlatVecIter {
-            reader: ReadVisitor::from_bytes(self.data.as_slice()),
+            reader: ReadVisitor::from_bytes(self.as_slice()),
             _marker: PhantomData,
         }
     }
@@ -199,11 +204,11 @@ pub struct FlatVecIter<'buf, T> {
     _marker: PhantomData<T>,
 }
 
-impl<'buf, T: FlatVecValue<'buf>> Iterator for FlatVecIter<'buf, T> {
+impl<'buf, T: FlatVecValue> Iterator for FlatVecIter<'buf, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.reader.read().ok()
+        read_from(&mut self.reader).ok()
     }
 }
 
@@ -218,11 +223,10 @@ mod tests {
         ts: u64,
     }
 
-    unsafe impl<'buf> FlatVecValue<'buf> for Point {
-        unsafe fn visit<V: FlatVisitor<'buf>>(
-            place: *mut Self,
-            v: &mut V,
-        ) -> Result<(), FlatError> {
+    unsafe impl FlatVecValue for Point {
+        const ALIGN: usize = align_of::<Point>();
+
+        unsafe fn visit<V: FlatVisitor>(place: *mut Self, v: &mut V) -> Result<(), FlatError> {
             unsafe {
                 v.scalar(&raw mut (*place).val)?;
                 v.scalar(&raw mut (*place).ts)?;
@@ -264,6 +268,48 @@ mod tests {
         assert_eq!(collected.len(), 0);
     }
 
+    #[repr(align(64))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Overaligned(u64);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct MixedAlignment {
+        prefix: u8,
+        value: Overaligned,
+        suffix: u32,
+    }
+
+    unsafe impl FlatVecValue for MixedAlignment {
+        const ALIGN: usize = align_of::<Overaligned>();
+
+        unsafe fn visit<V: FlatVisitor>(place: *mut Self, v: &mut V) -> Result<(), FlatError> {
+            unsafe {
+                v.scalar(&raw mut (*place).prefix)?;
+                v.scalar(&raw mut (*place).value)?;
+                v.scalar(&raw mut (*place).suffix)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_overaligned_values_survive_growth() {
+        let values: Vec<_> = (0..20)
+            .map(|i| MixedAlignment {
+                prefix: i as u8,
+                value: Overaligned(i),
+                suffix: i as u32 * 10,
+            })
+            .collect();
+        let mut flatvec = FlatVec::new();
+        for value in values.iter().copied() {
+            flatvec.push(value);
+        }
+
+        let collected: Vec<_> = flatvec.iter().collect();
+        assert_eq!(collected, values);
+    }
+
     /// variable-sized example
     #[derive(Debug, PartialEq, Clone)]
     struct Tag<'buf> {
@@ -271,11 +317,10 @@ mod tests {
         ts: f64,
     }
 
-    unsafe impl<'buf> FlatVecValue<'buf> for Tag<'buf> {
-        unsafe fn visit<V: FlatVisitor<'buf>>(
-            place: *mut Self,
-            v: &mut V,
-        ) -> Result<(), FlatError> {
+    unsafe impl<'buf> FlatVecValue for Tag<'buf> {
+        const ALIGN: usize = align_of::<f64>();
+
+        unsafe fn visit<V: FlatVisitor>(place: *mut Self, v: &mut V) -> Result<(), FlatError> {
             unsafe {
                 // `&str` has the same layout as `&[u8]`.
                 let val = (&raw mut (*place).val).cast::<&'buf [u8]>();
@@ -321,13 +366,12 @@ mod tests {
         flag: u8,
     }
 
-    unsafe impl<'buf> FlatVecValue<'buf> for Series<'buf> {
-        unsafe fn visit<V: FlatVisitor<'buf>>(
-            place: *mut Self,
-            v: &mut V,
-        ) -> Result<(), FlatError> {
+    unsafe impl<'buf> FlatVecValue for Series<'buf> {
+        const ALIGN: usize = align_of::<Point>();
+
+        unsafe fn visit<V: FlatVisitor>(place: *mut Self, v: &mut V) -> Result<(), FlatError> {
             unsafe {
-                v.nested(&raw mut (*place).name)?;
+                FlatVecValue::visit(&raw mut (*place).name, v)?;
 
                 let points = &raw mut (*place).points;
                 let len = v.slice_len::<u16, _>(points)?;

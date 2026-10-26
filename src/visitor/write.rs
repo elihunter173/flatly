@@ -2,14 +2,14 @@ use std::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 use super::{FlatError, FlatLen, FlatVisitor};
 
-pub struct WriteVisitor<'a> {
+pub struct WriteVisitor<'buf> {
     start: NonNull<u8>,
     end: NonNull<u8>,
-    _lifetime: PhantomData<&'a mut [MaybeUninit<u8>]>,
+    _lifetime: PhantomData<&'buf mut [MaybeUninit<u8>]>,
 }
 
-impl<'a> WriteVisitor<'a> {
-    pub(crate) fn from_uninit_bytes(bytes: &'a mut [MaybeUninit<u8>]) -> Self {
+impl<'buf> WriteVisitor<'buf> {
+    pub(crate) fn from_uninit_bytes(bytes: &'buf mut [MaybeUninit<u8>]) -> Self {
         let range = bytes.as_mut_ptr_range();
         Self {
             start: NonNull::new(range.start.cast()).unwrap(),
@@ -41,7 +41,7 @@ impl<'a> WriteVisitor<'a> {
 }
 
 // The writer copies borrowed data out, so it doesn't care what lifetime the borrows have.
-impl<'buf> FlatVisitor<'buf> for WriteVisitor<'_> {
+impl FlatVisitor for WriteVisitor<'_> {
     unsafe fn scalar<T: Copy>(&mut self, place: *mut T) -> Result<(), FlatError> {
         unsafe {
             let v = place.read();
@@ -50,10 +50,7 @@ impl<'buf> FlatVisitor<'buf> for WriteVisitor<'_> {
         Ok(())
     }
 
-    unsafe fn slice_len<L: FlatLen, T>(
-        &mut self,
-        place: *mut &'buf [T],
-    ) -> Result<usize, FlatError> {
+    unsafe fn slice_len<L: FlatLen, T>(&mut self, place: *mut &[T]) -> Result<usize, FlatError> {
         unsafe {
             let len = place.read().len();
             let mut stored = L::from_usize(len).ok_or(FlatError::LenOverflow)?;
@@ -64,7 +61,7 @@ impl<'buf> FlatVisitor<'buf> for WriteVisitor<'_> {
 
     unsafe fn slice_data<T: Copy>(
         &mut self,
-        place: *mut &'buf [T],
+        place: *mut &[T],
         len: usize,
     ) -> Result<(), FlatError> {
         unsafe {
