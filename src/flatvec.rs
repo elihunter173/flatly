@@ -101,7 +101,7 @@ pub unsafe trait FlatVecSchema {
 ///
 /// # Invariants
 ///
-/// - `len <= capacity`.
+/// - `count <= len <= capacity`; each tracked element consumes at least one byte.
 /// - If `capacity == 0`, `ptr` is dangling. Otherwise, it points to a live allocation.
 /// - Bytes `0..len` contain complete encodings of `S`. Field data is initialized,
 ///   but alignment gaps and padding within scalar or slice elements may not be.
@@ -113,6 +113,8 @@ pub struct FlatVec<S: FlatVecSchema> {
     len: usize,
     /// Total size of the allocation in bytes.
     capacity: usize,
+    /// Number of complete, non-zero-byte element encodings.
+    count: usize,
     _marker: PhantomData<S>,
 }
 
@@ -140,6 +142,7 @@ impl<S: FlatVecSchema> FlatVec<S> {
             ptr: NonNull::dangling(),
             len: 0,
             capacity: 0,
+            count: 0,
             _marker: PhantomData,
         }
     }
@@ -210,18 +213,6 @@ impl<S: FlatVecSchema> FlatVec<S> {
         self.capacity = new_capacity;
     }
 
-    /// Sets the number of in-use bytes to `new_len`.
-    ///
-    /// # Safety
-    ///
-    /// `new_len` must be `<= capacity`, and bytes `0..new_len` must contain
-    /// complete, valid encodings of `S`. Field data must be initialized, but
-    /// alignment gaps and padding within encoded types may remain uninitialized.
-    unsafe fn set_len(&mut self, new_len: usize) {
-        debug_assert!(new_len <= self.capacity);
-        self.len = new_len;
-    }
-
     /// Measures `v`, reserves sufficient capacity, and writes it once to the back
     /// of `FlatVec`. Capacity grows at least geometrically when necessary.
     ///
@@ -279,9 +270,10 @@ impl<S: FlatVecSchema> FlatVec<S> {
             written, size,
             "FlatVec schema size changed between measurement and write"
         );
-        // SAFETY: every measured byte now belongs to a complete encoding;
-        // alignment gaps and typed padding may remain uninitialized.
-        unsafe { self.set_len(new_len) };
+        self.len = new_len;
+        // Each counted element consumes at least one byte, so count + 1 is
+        // bounded by the validated encoded length.
+        self.count += 1;
     }
 
     /// Returns the first element, or `None` if the vector is empty.
@@ -296,9 +288,11 @@ impl<S: FlatVecSchema> FlatVec<S> {
     ///
     /// The iterator yields all elements in insertion order, with references
     /// borrowing this vector for the lifetime of the borrow passed to `iter`.
+    /// Its length and size hint report the exact number of remaining elements.
     pub fn iter(&self) -> FlatVecIter<'_, S> {
         FlatVecIter {
             reader: ReadVisitor::from_uninit_bytes(self.as_slice()),
+            remaining: self.count,
             _marker: PhantomData,
         }
     }
@@ -311,6 +305,8 @@ pub struct FlatVecIter<'buf, S> {
     /// Cursor over the vector's in-use bytes, positioned at the start of the
     /// next element to decode.
     reader: ReadVisitor<'buf>,
+    /// Number of encoded elements not yet yielded.
+    remaining: usize,
     _marker: PhantomData<S>,
 }
 
@@ -318,23 +314,32 @@ impl<'buf, S: FlatVecSchema> Iterator for FlatVecIter<'buf, S> {
     type Item = S::Value<'buf>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let remaining = self.reader.remaining();
-        if remaining == 0 {
+        if self.remaining == 0 {
             return None;
         }
+        let remaining = self.reader.remaining();
         let mut out = MaybeUninit::<S::Value<'_>>::uninit();
         unsafe {
             if S::visit(out.as_mut_ptr(), &mut self.reader).is_err() {
+                self.remaining = 0;
                 return None;
             }
             debug_assert!(
                 self.reader.remaining() < remaining,
                 "FlatVec schema decoded no bytes"
             );
+            self.remaining -= 1;
             Some(out.assume_init())
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl<S: FlatVecSchema> ExactSizeIterator for FlatVecIter<'_, S> {}
+impl<S: FlatVecSchema> std::iter::FusedIterator for FlatVecIter<'_, S> {}
 
 #[cfg(test)]
 mod tests {
@@ -453,6 +458,8 @@ mod tests {
         assert_eq!(result.is_err(), cfg!(debug_assertions));
         assert_eq!(values.len, 0);
         assert_eq!(values.first(), None);
+        assert_eq!(values.iter().len(), 0);
+        assert_eq!(values.iter().size_hint(), (0, Some(0)));
         assert_eq!(values.iter().count(), 0);
     }
 
@@ -531,6 +538,53 @@ mod tests {
     }
 
     #[test]
+    fn test_exact_size_iterator_with_variable_sized_elements_and_growth() {
+        let inputs = [
+            String::new(),
+            "short".to_owned(),
+            "x".repeat(1024),
+            "last".to_owned(),
+        ];
+        let mut values = FlatVec::<TagSchema>::new();
+        assert_eq!(values.iter().len(), 0);
+        assert_eq!(values.iter().size_hint(), (0, Some(0)));
+        for (i, input) in inputs.iter().enumerate() {
+            values.push(Tag {
+                val: input,
+                ts: i as f64,
+            });
+            assert_eq!(values.iter().len(), i + 1);
+        }
+
+        let mut iter = values.iter();
+        for (i, input) in inputs.iter().enumerate() {
+            let remaining = inputs.len() - i;
+            assert_eq!(iter.len(), remaining);
+            assert_eq!(iter.size_hint(), (remaining, Some(remaining)));
+            assert_eq!(
+                iter.next(),
+                Some(Tag {
+                    val: input,
+                    ts: i as f64
+                })
+            );
+        }
+        assert_eq!(iter.len(), 0);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next(), None);
+        assert_eq!(values.iter().len(), inputs.len());
+
+        let mut skipped = values.iter();
+        assert_eq!(skipped.nth(1).unwrap().val, inputs[1]);
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped.size_hint(), (2, Some(2)));
+        assert_eq!(skipped.nth(10), None);
+        assert_eq!(skipped.len(), 0);
+        assert_eq!(skipped.size_hint(), (0, Some(0)));
+    }
+
+    #[test]
     fn test_measured_appends_write_once_and_preserve_unaligned_row_offsets() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -579,6 +633,8 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!((values.ptr, values.len, values.capacity), previous);
+        assert_eq!(values.iter().len(), 2);
+        assert_eq!(values.iter().size_hint(), (2, Some(2)));
         assert_eq!(WRITES.load(Ordering::Relaxed), 2);
 
         values.push((b"last", 3, 30));

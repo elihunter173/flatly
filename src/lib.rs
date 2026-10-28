@@ -10,5 +10,8 @@
 //! This makes it possible to store variable-sized records, as a string, with no per-element heap
 //! allocation. Decoded values can also borrow directly from the buffer (for example `&'buf str`).
 
+mod sealed;
+
+pub mod flatcolumnvec;
 pub mod flatvec;
 pub mod visitor;

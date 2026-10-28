@@ -57,18 +57,29 @@ pub enum FlatError {
     LenOverflow,
 }
 
-pub trait FlatLen: Copy + 'static + sealed::Sealed {
+/// An encoded slice length, implemented only for supported unsigned integers.
+///
+/// This trait is sealed:
+///
+/// ```compile_fail,E0277
+/// use flatly::visitor::FlatLen;
+/// #[derive(Clone, Copy)]
+/// struct CustomLen(u8);
+/// impl FlatLen for CustomLen {
+///     fn from_usize(n: usize) -> Option<Self> {
+///         u8::try_from(n).ok().map(Self)
+///     }
+///     fn to_usize(self) -> Option<usize> { Some(self.0 as usize) }
+/// }
+/// ```
+pub trait FlatLen: Copy + 'static + crate::sealed::Sealed {
     fn from_usize(n: usize) -> Option<Self>;
     fn to_usize(self) -> Option<usize>;
 }
 
-mod sealed {
-    pub trait Sealed {}
-}
-
 macro_rules! impl_flat_len {
     ($($t:ty),*) => {$(
-        impl sealed::Sealed for $t {}
+        impl crate::sealed::Sealed for $t {}
         impl FlatLen for $t {
             fn from_usize(n: usize) -> Option<Self> { <$t>::try_from(n).ok() }
             fn to_usize(self) -> Option<usize> { usize::try_from(self).ok() }

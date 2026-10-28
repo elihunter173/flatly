@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn counts_multiple_values_and_alignment_padding() {
-        let mut measure = MeasureVisitor::new();
+        let mut measure = MeasureVisitor::default();
         assert_eq!(measure.size(), 0);
         let mut byte = 1u8;
         let mut scalar = 2u64;
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn empty_and_zero_sized_payloads_still_include_prefix_and_padding() {
         let mut empty: &[Aligned] = &[];
-        let mut measure = MeasureVisitor::new();
+        let mut measure = MeasureVisitor::default();
         unsafe { measure.slice::<u8, _>(&raw mut empty).unwrap() };
         assert_eq!(measure.size(), 64);
 
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn scalar_measurement_does_not_read_the_value() {
         let mut value = MaybeUninit::<Padded>::uninit();
-        let mut measure = MeasureVisitor::new();
+        let mut measure = MeasureVisitor::default();
         unsafe { measure.scalar(value.as_mut_ptr()).unwrap() };
         assert_eq!(measure.size(), size_of::<Padded>());
     }
@@ -226,7 +226,7 @@ mod tests {
         );
         assert_eq!(measure.size(), 0);
 
-        let mut measure = MeasureVisitor::new();
+        let mut measure = MeasureVisitor::default();
         assert_eq!(
             measure.measure_array::<u64>(usize::MAX),
             Err(FlatError::InsufficientSpace)
