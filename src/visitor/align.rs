@@ -2,7 +2,7 @@ use std::mem::align_of;
 
 use super::{FlatError, FlatLen, FlatVisitor};
 
-/// Visitor that computes the largest alignment used by a `FlatVecValue` encoding.
+/// Visitor that computes the largest alignment used by a `FlatVecSchema` encoding.
 pub struct AlignOfVisitor {
     alignment: usize,
 }
@@ -21,20 +21,23 @@ impl AlignOfVisitor {
     }
 }
 
-impl FlatVisitor for AlignOfVisitor {
-    unsafe fn scalar<T: Copy>(&mut self, _place: *mut T) -> Result<(), FlatError> {
+impl<'buf> FlatVisitor<'buf> for AlignOfVisitor {
+    unsafe fn scalar<T: Copy + 'static>(&mut self, _place: *mut T) -> Result<(), FlatError> {
         self.include::<T>();
         Ok(())
     }
 
-    unsafe fn slice_len<L: FlatLen, T>(&mut self, _place: *mut &[T]) -> Result<usize, FlatError> {
+    unsafe fn slice_len<L: FlatLen, T>(
+        &mut self,
+        _place: *mut &'buf [T],
+    ) -> Result<usize, FlatError> {
         self.include::<L>();
         Ok(0)
     }
 
-    unsafe fn slice_data<T: Copy>(
+    unsafe fn slice_data<T: Copy + 'static>(
         &mut self,
-        _place: *mut &[T],
+        _place: *mut &'buf [T],
         _len: usize,
     ) -> Result<(), FlatError> {
         self.include::<T>();

@@ -12,7 +12,7 @@ struct Row<'buf> {
     ts: u64,
 }
 
-unsafe fn visit_split<'buf, L: FlatVisitor, D: FlatVisitor>(
+unsafe fn visit_split<'buf, L: FlatVisitor<'buf>, D: FlatVisitor<'buf>>(
     place: *mut Row<'buf>,
     lens: &mut L,
     data: &mut D,

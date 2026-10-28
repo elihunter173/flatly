@@ -12,30 +12,101 @@ use std::{
 
 use crate::visitor::{AlignOfVisitor, FlatError, FlatVisitor, ReadVisitor, WriteVisitor};
 
-pub unsafe trait FlatVecValue {
+/// Defines a flat encoding and its value type for each buffer lifetime.
+///
+/// Implement this trait on a separate schema marker type. For example,
+/// `TagSchema` can define `type Value<'buf> = Tag<'buf>`. The same traversal
+/// is used to write values and read them back; no schema instance is needed.
+///
+/// A local vector cannot produce values requiring a `'static` buffer:
+///
+/// ```compile_fail
+/// use flatly::flatvec::{FlatVec, FlatVecSchema};
+/// fn invent_static<S: FlatVecSchema>(values: &FlatVec<S>) -> S::Value<'static> {
+///     values.first().unwrap()
+/// }
+/// ```
+///
+/// Decoded values cannot escape the vector, whether read directly or iterated:
+///
+/// ```compile_fail,E0515
+/// use flatly::flatvec::{FlatVec, FlatVecSchema};
+/// fn escape<'buf, S: FlatVecSchema + 'buf>() -> S::Value<'buf> {
+///     let values = FlatVec::<S>::new();
+///     values.first().unwrap()
+/// }
+/// ```
+///
+/// ```compile_fail,E0515
+/// use flatly::flatvec::{FlatVec, FlatVecSchema};
+/// fn escape<'buf, S: FlatVecSchema + 'buf>() -> S::Value<'buf> {
+///     let values = FlatVec::<S>::new();
+///     values.iter().next().unwrap()
+/// }
+/// ```
+///
+/// Mutation cannot invalidate a decoded value that is still in use:
+///
+/// ```compile_fail,E0502
+/// use flatly::flatvec::{FlatVec, FlatVecSchema};
+/// fn mutate<'buf, S: FlatVecSchema>(
+///     values: &'buf mut FlatVec<S>, next: S::Value<'_>,
+/// ) -> S::Value<'buf> {
+///     let first = values.first().unwrap();
+///     values.push(next);
+///     first
+/// }
+/// ```
+///
+/// # Safety
+///
+/// `ALIGN` must be a valid allocation alignment and the maximum alignment used
+/// by the encoding. `visit` must visit every field, initializing a valid value on
+/// a successful read, and use the same encoding for every lifetime. Borrowed data
+/// must be visited through lifetime-bound slice operations, not copied as
+/// reference-valued scalars. Scalar and slice element types must be valid to copy
+/// into the buffer and back without retaining references to the original value.
+pub unsafe trait FlatVecSchema {
     const ALIGN: usize;
+
+    /// The value type, which may borrow from the encoded buffer for `'buf`.
+    ///
+    /// No `Self: 'buf` bound is needed: values borrow the buffer, not the schema.
+    type Value<'buf>;
 
     /// Visits every field in the encoded representation without reading from `place` directly.
     ///
     /// Implementations may form raw pointers to fields and pass them to the visitor, but must not
     /// dereference `place` themselves.
-    unsafe fn visit<V: FlatVisitor>(place: *mut Self, v: &mut V) -> Result<(), FlatError>;
+    ///
+    /// # Safety
+    ///
+    /// `place` must be valid for the visitor's operations: writable storage for
+    /// a reader, or an initialized value for a writer.
+    unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+        place: *mut Self::Value<'buf>,
+        v: &mut V,
+    ) -> Result<(), FlatError>;
 }
 
-pub(crate) fn read_from<T: FlatVecValue>(visitor: &mut ReadVisitor) -> Result<T, FlatError> {
-    let mut out = MaybeUninit::<T>::uninit();
-    // SAFETY: `out` is valid for writes; the `FlatVecValue` contract guarantees every field is
-    // initialized on success. On error `out` is dropped as `MaybeUninit`, so nothing leaks
-    // or double-drops.
+pub(crate) fn read_from<'buf, S: FlatVecSchema>(
+    visitor: &mut ReadVisitor<'buf>,
+) -> Result<S::Value<'buf>, FlatError> {
+    let mut out = MaybeUninit::<S::Value<'buf>>::uninit();
+    // SAFETY: `out` is valid for writes; the `FlatVecSchema` contract guarantees every field is
+    // initialized on success. On error `out` is dropped as `MaybeUninit`, so no
+    // uninitialized fields are dropped.
     unsafe {
-        T::visit(out.as_mut_ptr(), visitor)?;
+        S::visit(out.as_mut_ptr(), visitor)?;
         Ok(out.assume_init())
     }
 }
 
-/// A Vec-like data structure that stores stores elements in a flat array.
+/// A Vec-like data structure that stores elements in a flat array.
 ///
-/// Elements are written and read back via their [`FlatVecValue`] implementation.
+/// `S` is a schema marker implementing [`FlatVecSchema`]. Inputs and decoded
+/// elements have type [`S::Value<'buf>`](FlatVecSchema::Value), with decoded
+/// references borrowing this vector rather than the original input values.
 ///
 /// Because elements can be variable sized, there is no random access by index.
 ///
@@ -44,33 +115,33 @@ pub(crate) fn read_from<T: FlatVecValue>(visitor: &mut ReadVisitor) -> Result<T,
 /// - `len <= capacity`.
 /// - If `capacity == 0`, `ptr` is dangling. Otherwise, it points to a live allocation.
 /// - Bytes `0..len` are in use and `len..capacity` are uninitialized.
-pub struct FlatVec<T: FlatVecValue> {
+pub struct FlatVec<S: FlatVecSchema> {
     /// Start of the allocation, or [`NonNull::dangling`] when `capacity == 0`.
     ptr: NonNull<u8>,
     /// Number of bytes at the start of the buffer are initialized.
     len: usize,
     /// Total size of the allocation in bytes.
     capacity: usize,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<S>,
 }
 
-impl<T: FlatVecValue> Default for FlatVec<T> {
+impl<S: FlatVecSchema> Default for FlatVec<S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: FlatVecValue> Drop for FlatVec<T> {
+impl<S: FlatVecSchema> Drop for FlatVec<S> {
     /// Frees the allocation, if there is one.
     fn drop(&mut self) {
         if self.capacity != 0 {
-            let layout = Layout::from_size_align(self.capacity, T::ALIGN).expect("invalid layout");
+            let layout = Layout::from_size_align(self.capacity, S::ALIGN).expect("invalid layout");
             unsafe { alloc::dealloc(self.ptr.as_ptr(), layout) }
         }
     }
 }
 
-impl<T: FlatVecValue> FlatVec<T> {
+impl<S: FlatVecSchema> FlatVec<S> {
     /// Creates an empty `FlatVec` without allocating.
     pub fn new() -> Self {
         Self {
@@ -115,14 +186,14 @@ impl<T: FlatVecValue> FlatVec<T> {
             self.capacity.checked_mul(2).expect("capacity overflow")
         };
 
-        let new_layout = Layout::from_size_align(new_capacity, T::ALIGN).expect("invalid layout");
+        let new_layout = Layout::from_size_align(new_capacity, S::ALIGN).expect("invalid layout");
 
         let new_ptr = if self.capacity == 0 {
             unsafe { alloc::alloc(new_layout) }
         } else {
             // TODO: Realloc needs to preserve the alignment of the current buffer.
             let old_layout =
-                Layout::from_size_align(self.capacity, T::ALIGN).expect("invalid layout");
+                Layout::from_size_align(self.capacity, S::ALIGN).expect("invalid layout");
             unsafe { alloc::realloc(self.ptr.as_ptr(), old_layout, new_capacity) }
         };
 
@@ -142,25 +213,28 @@ impl<T: FlatVecValue> FlatVec<T> {
 
     /// Appends `v` to the back of `FlatVec`. If item doesn't fit, the buffer size is doubled.
     ///
+    /// Borrowed data is copied into the buffer, so its input lifetime is independent
+    /// of the vector and of the schema `S` used to select the encoding.
+    ///
     /// # Panics
     ///
     /// Panics if growing the buffer fails, or if a slice in `v` is too long for the length type
-    /// its [`FlatVecValue`] impl stores it with.
-    pub fn push(&mut self, mut v: T) {
-        // Ensure T::ALIGN is right
+    /// its [`FlatVecSchema`] impl stores it with.
+    pub fn push(&mut self, mut v: S::Value<'_>) {
+        // Ensure S::ALIGN is right
         if cfg!(debug_assertions) {
             let mut align_visitor = AlignOfVisitor::new();
             unsafe {
-                T::visit(&raw mut v, &mut align_visitor)
+                S::visit(&raw mut v, &mut align_visitor)
                     .expect("align of visitor never returns errors")
             };
-            assert_eq!(T::ALIGN, align_visitor.alignment());
+            assert_eq!(S::ALIGN, align_visitor.alignment());
         }
 
         loop {
             let mut writer = WriteVisitor::from_uninit_bytes(self.spare_capacity_mut());
-            // SAFETY: `v` is a live, initialized `T`; the write visitor only reads through it.
-            match unsafe { T::visit(&raw mut v, &mut writer) } {
+            // SAFETY: `v` is a live, initialized value; the write visitor only reads through it.
+            match unsafe { S::visit(&raw mut v, &mut writer) } {
                 Ok(()) => {
                     let write_addr = writer.as_ptr().addr().get();
                     let new_len = write_addr - self.ptr.as_ptr().addr();
@@ -178,15 +252,19 @@ impl<T: FlatVecValue> FlatVec<T> {
     }
 
     /// Returns the first element, or `None` if the vector is empty.
-    pub fn first(&self) -> Option<T> {
+    ///
+    /// References in the returned value borrow this vector, preventing it from
+    /// being dropped or mutated while those references are still in use.
+    pub fn first(&self) -> Option<S::Value<'_>> {
         let mut visitor = ReadVisitor::from_bytes(self.as_slice());
-        read_from(&mut visitor).ok()
+        read_from::<S>(&mut visitor).ok()
     }
 
     /// Returns an iterator over the `FlatVec`.
     ///
-    /// The iterator yields all elements in insertion order.
-    pub fn iter(&self) -> FlatVecIter<'_, T> {
+    /// The iterator yields all elements in insertion order, with references
+    /// borrowing this vector for the lifetime of the borrow passed to `iter`.
+    pub fn iter(&self) -> FlatVecIter<'_, S> {
         FlatVecIter {
             reader: ReadVisitor::from_bytes(self.as_slice()),
             _marker: PhantomData,
@@ -197,18 +275,18 @@ impl<T: FlatVecValue> FlatVec<T> {
 /// Iterator over the elements of a [`FlatVec`].
 ///
 /// Returned by [`FlatVec::iter`].
-pub struct FlatVecIter<'buf, T> {
+pub struct FlatVecIter<'buf, S> {
     /// Cursor over the vector's in-use bytes, positioned at the start of the
     /// next element to decode.
     reader: ReadVisitor<'buf>,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<S>,
 }
 
-impl<'buf, T: FlatVecValue> Iterator for FlatVecIter<'buf, T> {
-    type Item = T;
+impl<'buf, S: FlatVecSchema> Iterator for FlatVecIter<'buf, S> {
+    type Item = S::Value<'buf>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        read_from(&mut self.reader).ok()
+        read_from::<S>(&mut self.reader).ok()
     }
 }
 
@@ -223,10 +301,16 @@ mod tests {
         ts: u64,
     }
 
-    unsafe impl FlatVecValue for Point {
-        const ALIGN: usize = align_of::<Point>();
+    struct PointSchema;
 
-        unsafe fn visit<V: FlatVisitor>(place: *mut Self, v: &mut V) -> Result<(), FlatError> {
+    unsafe impl FlatVecSchema for PointSchema {
+        const ALIGN: usize = align_of::<Point>();
+        type Value<'buf> = Point;
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            place: *mut Self::Value<'buf>,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
             unsafe {
                 v.scalar(&raw mut (*place).val)?;
                 v.scalar(&raw mut (*place).ts)?;
@@ -237,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_push_and_first() {
-        let mut vec = FlatVec::<Point>::new();
+        let mut vec = FlatVec::<PointSchema>::new();
         let point = Point { val: 3.14, ts: 255 };
         vec.push(point);
         let retrieved = vec.first().unwrap();
@@ -246,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_iterator() {
-        let mut flatvec = FlatVec::<Point>::new();
+        let mut flatvec = FlatVec::<PointSchema>::new();
         let points = vec![
             Point { val: 1.0, ts: 100 },
             Point { val: 2.0, ts: 200 },
@@ -263,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_empty_iterator() {
-        let vec = FlatVec::<Point>::new();
+        let vec = FlatVec::<PointSchema>::new();
         let collected: Vec<Point> = vec.iter().collect();
         assert_eq!(collected.len(), 0);
     }
@@ -279,10 +363,16 @@ mod tests {
         suffix: u32,
     }
 
-    unsafe impl FlatVecValue for MixedAlignment {
-        const ALIGN: usize = align_of::<Overaligned>();
+    struct MixedAlignmentSchema;
 
-        unsafe fn visit<V: FlatVisitor>(place: *mut Self, v: &mut V) -> Result<(), FlatError> {
+    unsafe impl FlatVecSchema for MixedAlignmentSchema {
+        const ALIGN: usize = align_of::<Overaligned>();
+        type Value<'buf> = MixedAlignment;
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            place: *mut Self::Value<'buf>,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
             unsafe {
                 v.scalar(&raw mut (*place).prefix)?;
                 v.scalar(&raw mut (*place).value)?;
@@ -301,7 +391,7 @@ mod tests {
                 suffix: i as u32 * 10,
             })
             .collect();
-        let mut flatvec = FlatVec::new();
+        let mut flatvec = FlatVec::<MixedAlignmentSchema>::new();
         for value in values.iter().copied() {
             flatvec.push(value);
         }
@@ -317,10 +407,16 @@ mod tests {
         ts: f64,
     }
 
-    unsafe impl<'buf> FlatVecValue for Tag<'buf> {
-        const ALIGN: usize = align_of::<f64>();
+    struct TagSchema;
 
-        unsafe fn visit<V: FlatVisitor>(place: *mut Self, v: &mut V) -> Result<(), FlatError> {
+    unsafe impl FlatVecSchema for TagSchema {
+        const ALIGN: usize = align_of::<f64>();
+        type Value<'buf> = Tag<'buf>;
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            place: *mut Self::Value<'buf>,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
             unsafe {
                 // `&str` has the same layout as `&[u8]`.
                 let val = (&raw mut (*place).val).cast::<&'buf [u8]>();
@@ -333,8 +429,75 @@ mod tests {
     }
 
     #[test]
+    fn test_tag_copies_borrowed_input() {
+        let input = String::from("temporary input");
+        let long_input = "x".repeat(1024);
+        let mut flatvec = FlatVec::<TagSchema>::new();
+        flatvec.push(Tag {
+            val: &input,
+            ts: 1.0,
+        });
+        flatvec.push(Tag {
+            val: &long_input,
+            ts: 2.0,
+        });
+
+        let first = flatvec.first().unwrap();
+        assert_eq!(first.val, input);
+        assert_ne!(first.val.as_ptr(), input.as_ptr());
+        let mut iter = flatvec.iter();
+        let from_iter = iter.next().unwrap();
+        drop(iter);
+        assert_eq!(from_iter, first);
+
+        let collected: Vec<_> = flatvec.iter().collect();
+        assert_eq!(collected[0].val, input);
+        assert_eq!(collected[1].val, long_input);
+    }
+
+    #[test]
+    fn test_tag_read_push_read_with_short_lived_inputs() {
+        let mut flatvec = FlatVec::<TagSchema>::new();
+        {
+            let input = String::from("hello");
+            flatvec.push(Tag {
+                val: &input,
+                ts: 1.0,
+            });
+        }
+        assert_eq!(flatvec.first().unwrap().val, "hello");
+        assert_eq!(flatvec.iter().next().unwrap().val, "hello");
+
+        // Both the input borrow and the previous buffer borrows have ended.
+        // Force growth, then borrow the vector again with a fresh value lifetime.
+        let capacity = flatvec.capacity;
+        {
+            let input = "x".repeat(capacity + 1);
+            flatvec.push(Tag {
+                val: &input,
+                ts: 2.0,
+            });
+        }
+        assert!(flatvec.capacity > capacity);
+        assert_eq!(flatvec.first().unwrap().val, "hello");
+        let collected: Vec<_> = flatvec.iter().collect();
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected[1].val.len(), capacity + 1);
+    }
+
+    #[test]
+    fn test_owned_value_can_outlive_vector() {
+        let point = {
+            let mut flatvec = FlatVec::<PointSchema>::new();
+            flatvec.push(Point { val: 1.0, ts: 2 });
+            flatvec.first().unwrap()
+        };
+        assert_eq!(point, Point { val: 1.0, ts: 2 });
+    }
+
+    #[test]
     fn test_tag_with_string() {
-        let mut flatvec = FlatVec::<Tag>::new();
+        let mut flatvec = FlatVec::<TagSchema>::new();
         let tags = vec![
             Tag {
                 val: "hello",
@@ -366,12 +529,18 @@ mod tests {
         flag: u8,
     }
 
-    unsafe impl<'buf> FlatVecValue for Series<'buf> {
-        const ALIGN: usize = align_of::<Point>();
+    struct SeriesSchema;
 
-        unsafe fn visit<V: FlatVisitor>(place: *mut Self, v: &mut V) -> Result<(), FlatError> {
+    unsafe impl FlatVecSchema for SeriesSchema {
+        const ALIGN: usize = align_of::<Point>();
+        type Value<'buf> = Series<'buf>;
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            place: *mut Self::Value<'buf>,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
             unsafe {
-                FlatVecValue::visit(&raw mut (*place).name, v)?;
+                TagSchema::visit(&raw mut (*place).name, v)?;
 
                 let points = &raw mut (*place).points;
                 let len = v.slice_len::<u16, _>(points)?;
@@ -407,7 +576,7 @@ mod tests {
             },
         ];
 
-        let mut flatvec = FlatVec::<Series>::new();
+        let mut flatvec = FlatVec::<SeriesSchema>::new();
         for s in &series {
             flatvec.push(s.clone());
         }

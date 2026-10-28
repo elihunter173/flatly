@@ -2,6 +2,21 @@ use std::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
 
 use super::{FlatError, FlatLen, FlatVisitor};
 
+/// Reads values and borrowed slices from a buffer.
+///
+/// A destination slice cannot outlive that buffer, even through a raw pointer:
+///
+/// ```compile_fail
+/// use std::mem::MaybeUninit;
+/// use flatly::visitor::{FlatVisitor, ReadVisitor};
+/// unsafe fn invent_static(reader: &mut ReadVisitor<'_>) -> &'static [u8] {
+///     let mut out = MaybeUninit::<&'static [u8]>::uninit();
+///     unsafe {
+///         reader.slice_data(out.as_mut_ptr(), 0).unwrap();
+///         out.assume_init()
+///     }
+/// }
+/// ```
 pub struct ReadVisitor<'buf> {
     start: NonNull<u8>,
     end: NonNull<u8>,
@@ -36,13 +51,16 @@ impl<'buf> ReadVisitor<'buf> {
     }
 }
 
-impl<'buf> FlatVisitor for ReadVisitor<'buf> {
-    unsafe fn scalar<T: Copy>(&mut self, place: *mut T) -> Result<(), FlatError> {
+impl<'buf> FlatVisitor<'buf> for ReadVisitor<'buf> {
+    unsafe fn scalar<T: Copy + 'static>(&mut self, place: *mut T) -> Result<(), FlatError> {
         unsafe { place.write(self.take_array::<T>(1)?.read()) };
         Ok(())
     }
 
-    unsafe fn slice_len<L: FlatLen, T>(&mut self, _place: *mut &[T]) -> Result<usize, FlatError> {
+    unsafe fn slice_len<L: FlatLen, T>(
+        &mut self,
+        _place: *mut &'buf [T],
+    ) -> Result<usize, FlatError> {
         let mut stored = MaybeUninit::<L>::uninit();
         unsafe {
             self.scalar(stored.as_mut_ptr())?;
@@ -53,9 +71,9 @@ impl<'buf> FlatVisitor for ReadVisitor<'buf> {
         }
     }
 
-    unsafe fn slice_data<T: Copy>(
+    unsafe fn slice_data<T: Copy + 'static>(
         &mut self,
-        place: *mut &[T],
+        place: *mut &'buf [T],
         len: usize,
     ) -> Result<(), FlatError> {
         unsafe {
