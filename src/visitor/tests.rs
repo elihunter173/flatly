@@ -1,4 +1,4 @@
-use std::{mem::MaybeUninit, slice};
+use std::mem::MaybeUninit;
 
 use super::*;
 
@@ -62,14 +62,15 @@ fn test_len_and_data_in_separate_visitors() {
             d - data_buf.0.as_ptr().addr(),
         )
     };
-    let lens_bytes = unsafe { slice::from_raw_parts(lens_buf.0.as_ptr().cast::<u8>(), lens_bytes) };
-    let data_bytes = unsafe { slice::from_raw_parts(data_buf.0.as_ptr().cast::<u8>(), data_bytes) };
+    // Keep padding as MaybeUninit instead of asserting every byte is initialized.
+    let lens_bytes = &lens_buf.0[..lens_bytes];
+    let data_bytes = &data_buf.0[..data_bytes];
 
     // Lengths column is exactly (u8 name_len, pad, u16 values_len) per row.
     assert_eq!(lens_bytes.len(), 3 * 4);
 
-    let mut lens = ReadVisitor::from_bytes(lens_bytes);
-    let mut data = ReadVisitor::from_bytes(data_bytes);
+    let mut lens = ReadVisitor::from_uninit_bytes(lens_bytes);
+    let mut data = ReadVisitor::from_uninit_bytes(data_bytes);
     let read: Vec<Row> = (0..rows.len())
         .map(|_| {
             let mut out = MaybeUninit::<Row>::uninit();

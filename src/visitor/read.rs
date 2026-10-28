@@ -2,7 +2,11 @@ use std::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
 
 use super::{FlatError, FlatLen, FlatVisitor};
 
-/// Reads values and borrowed slices from a buffer.
+/// Reads values and borrowed slices from an encoded buffer.
+///
+/// The buffer may contain uninitialized alignment gaps and padding within
+/// encoded types. Unsafe read operations must only access valid, initialized
+/// values of the requested types; padding need not be initialized.
 ///
 /// A destination slice cannot outlive that buffer, even through a raw pointer:
 ///
@@ -20,17 +24,21 @@ use super::{FlatError, FlatLen, FlatVisitor};
 pub struct ReadVisitor<'buf> {
     start: NonNull<u8>,
     end: NonNull<u8>,
-    _lifetime: PhantomData<&'buf [u8]>,
+    _lifetime: PhantomData<&'buf [MaybeUninit<u8>]>,
 }
 
 impl<'buf> ReadVisitor<'buf> {
-    pub(crate) fn from_bytes(bytes: &'buf [u8]) -> Self {
+    pub(crate) fn from_uninit_bytes(bytes: &'buf [MaybeUninit<u8>]) -> Self {
         let range = bytes.as_ptr_range();
         Self {
-            start: NonNull::new(range.start.cast_mut()).unwrap(),
-            end: NonNull::new(range.end.cast_mut()).unwrap(),
+            start: NonNull::new(range.start.cast_mut().cast()).unwrap(),
+            end: NonNull::new(range.end.cast_mut().cast()).unwrap(),
             _lifetime: PhantomData,
         }
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.end.addr().get() - self.start.addr().get()
     }
 
     fn take_array<T>(&mut self, len: usize) -> Result<NonNull<T>, FlatError> {
@@ -38,7 +46,7 @@ impl<'buf> ReadVisitor<'buf> {
             .checked_mul(len)
             .ok_or(FlatError::InsufficientSpace)?;
         let pad = self.start.align_offset(align_of::<T>());
-        let remaining = self.end.addr().get() - self.start.addr().get();
+        let remaining = self.remaining();
         let needed = pad.checked_add(size).ok_or(FlatError::InsufficientSpace)?;
         if needed > remaining {
             return Err(FlatError::InsufficientSpace);

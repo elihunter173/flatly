@@ -17,6 +17,9 @@ use crate::visitor::{AlignOfVisitor, FlatError, FlatVisitor, ReadVisitor, WriteV
 /// Implement this trait on a separate schema marker type. For example,
 /// `TagSchema` can define `type Value<'buf> = Tag<'buf>`. The same traversal
 /// is used to write values and read them back; no schema instance is needed.
+/// Zero-byte encodings are checked with debug assertions. They are not tracked
+/// as elements because the buffer cursor cannot distinguish them. Zero-sized
+/// values with non-empty encoded metadata are supported.
 ///
 /// A local vector cannot produce values requiring a `'static` buffer:
 ///
@@ -89,19 +92,6 @@ pub unsafe trait FlatVecSchema {
     ) -> Result<(), FlatError>;
 }
 
-pub(crate) fn read_from<'buf, S: FlatVecSchema>(
-    visitor: &mut ReadVisitor<'buf>,
-) -> Result<S::Value<'buf>, FlatError> {
-    let mut out = MaybeUninit::<S::Value<'buf>>::uninit();
-    // SAFETY: `out` is valid for writes; the `FlatVecSchema` contract guarantees every field is
-    // initialized on success. On error `out` is dropped as `MaybeUninit`, so no
-    // uninitialized fields are dropped.
-    unsafe {
-        S::visit(out.as_mut_ptr(), visitor)?;
-        Ok(out.assume_init())
-    }
-}
-
 /// A Vec-like data structure that stores elements in a flat array.
 ///
 /// `S` is a schema marker implementing [`FlatVecSchema`]. Inputs and decoded
@@ -114,11 +104,13 @@ pub(crate) fn read_from<'buf, S: FlatVecSchema>(
 ///
 /// - `len <= capacity`.
 /// - If `capacity == 0`, `ptr` is dangling. Otherwise, it points to a live allocation.
-/// - Bytes `0..len` are in use and `len..capacity` are uninitialized.
+/// - Bytes `0..len` contain complete encodings of `S`. Field data is initialized,
+///   but alignment gaps and padding within scalar or slice elements may not be.
+/// - Bytes `len..capacity` are spare storage and may be initialized or uninitialized.
 pub struct FlatVec<S: FlatVecSchema> {
     /// Start of the allocation, or [`NonNull::dangling`] when `capacity == 0`.
     ptr: NonNull<u8>,
-    /// Number of bytes at the start of the buffer are initialized.
+    /// Number of bytes occupied by encoded elements, including padding.
     len: usize,
     /// Total size of the allocation in bytes.
     capacity: usize,
@@ -152,16 +144,19 @@ impl<S: FlatVecSchema> FlatVec<S> {
         }
     }
 
-    /// Returns the initialized bytes (`0..len`) as a slice.
-    fn as_slice(&self) -> &[u8] {
+    /// Returns the encoded region (`0..len`), which may contain uninitialized padding.
+    fn as_slice(&self) -> &[MaybeUninit<u8>] {
         if self.capacity == 0 {
             &[]
         } else {
-            unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+            // SAFETY: the encoded region is within the allocation. MaybeUninit
+            // permits both initialized field data and uninitialized padding.
+            unsafe { slice::from_raw_parts(self.ptr.as_ptr().cast(), self.len) }
         }
     }
 
-    /// Returns the tail of uninitialized bytes at the end of Buf's allocation.
+    /// Returns spare storage after the encoded region. A failed write may have
+    /// initialized part of this storage; callers must not assume it is initialized.
     fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         if self.capacity == 0 {
             &mut []
@@ -205,7 +200,9 @@ impl<S: FlatVecSchema> FlatVec<S> {
     ///
     /// # Safety
     ///
-    /// `new_len` must be `<= capacity`, and bytes `0..new_len` must be initialized.
+    /// `new_len` must be `<= capacity`, and bytes `0..new_len` must contain
+    /// complete, valid encodings of `S`. Field data must be initialized, but
+    /// alignment gaps and padding within encoded types may remain uninitialized.
     unsafe fn set_len(&mut self, new_len: usize) {
         debug_assert!(new_len <= self.capacity);
         self.len = new_len;
@@ -219,7 +216,8 @@ impl<S: FlatVecSchema> FlatVec<S> {
     /// # Panics
     ///
     /// Panics if growing the buffer fails, or if a slice in `v` is too long for the length type
-    /// its [`FlatVecSchema`] impl stores it with.
+    /// its [`FlatVecSchema`] impl stores it with. In debug builds, also panics if
+    /// the schema successfully encodes a value without consuming any bytes.
     pub fn push(&mut self, mut v: S::Value<'_>) {
         // Ensure S::ALIGN is right
         if cfg!(debug_assertions) {
@@ -233,11 +231,13 @@ impl<S: FlatVecSchema> FlatVec<S> {
 
         loop {
             let mut writer = WriteVisitor::from_uninit_bytes(self.spare_capacity_mut());
+            let start = writer.as_ptr();
             // SAFETY: `v` is a live, initialized value; the write visitor only reads through it.
             match unsafe { S::visit(&raw mut v, &mut writer) } {
                 Ok(()) => {
-                    let write_addr = writer.as_ptr().addr().get();
-                    let new_len = write_addr - self.ptr.as_ptr().addr();
+                    debug_assert!(writer.as_ptr() != start, "FlatVec schema encoded no bytes");
+                    let written = writer.as_ptr().addr().get() - start.addr().get();
+                    let new_len = self.len + written;
                     unsafe { self.set_len(new_len) };
                     break;
                 }
@@ -256,8 +256,7 @@ impl<S: FlatVecSchema> FlatVec<S> {
     /// References in the returned value borrow this vector, preventing it from
     /// being dropped or mutated while those references are still in use.
     pub fn first(&self) -> Option<S::Value<'_>> {
-        let mut visitor = ReadVisitor::from_bytes(self.as_slice());
-        read_from::<S>(&mut visitor).ok()
+        self.iter().next()
     }
 
     /// Returns an iterator over the `FlatVec`.
@@ -266,7 +265,7 @@ impl<S: FlatVecSchema> FlatVec<S> {
     /// borrowing this vector for the lifetime of the borrow passed to `iter`.
     pub fn iter(&self) -> FlatVecIter<'_, S> {
         FlatVecIter {
-            reader: ReadVisitor::from_bytes(self.as_slice()),
+            reader: ReadVisitor::from_uninit_bytes(self.as_slice()),
             _marker: PhantomData,
         }
     }
@@ -286,13 +285,176 @@ impl<'buf, S: FlatVecSchema> Iterator for FlatVecIter<'buf, S> {
     type Item = S::Value<'buf>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        read_from::<S>(&mut self.reader).ok()
+        let remaining = self.reader.remaining();
+        if remaining == 0 {
+            return None;
+        }
+        let mut out = MaybeUninit::<S::Value<'_>>::uninit();
+        unsafe {
+            if S::visit(out.as_mut_ptr(), &mut self.reader).is_err() {
+                return None;
+            }
+            debug_assert!(
+                self.reader.remaining() < remaining,
+                "FlatVec schema decoded no bytes"
+            );
+            Some(out.assume_init())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct UnitSchema;
+
+    unsafe impl FlatVecSchema for UnitSchema {
+        const ALIGN: usize = 1;
+        type Value<'buf> = ();
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            place: *mut Self::Value<'buf>,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
+            unsafe { v.scalar(place) }
+        }
+    }
+
+    struct NoopSchema;
+
+    unsafe impl FlatVecSchema for NoopSchema {
+        const ALIGN: usize = 1;
+        type Value<'buf> = ();
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            _place: *mut Self::Value<'buf>,
+            _v: &mut V,
+        ) -> Result<(), FlatError> {
+            Ok(())
+        }
+    }
+
+    struct EmptySliceSchema;
+
+    unsafe impl FlatVecSchema for EmptySliceSchema {
+        const ALIGN: usize = 1;
+        type Value<'buf> = &'buf [u8];
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            place: *mut Self::Value<'buf>,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
+            unsafe { v.slice_data(place, 0) }
+        }
+    }
+
+    struct UnitWithMetadataSchema;
+
+    unsafe impl FlatVecSchema for UnitWithMetadataSchema {
+        const ALIGN: usize = 1;
+        type Value<'buf> = ();
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            place: *mut Self::Value<'buf>,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
+            let mut metadata = 0u8;
+            unsafe {
+                v.scalar(&raw mut metadata)?;
+                v.scalar(place)
+            }
+        }
+    }
+
+    struct UnitSliceSchema;
+
+    unsafe impl FlatVecSchema for UnitSliceSchema {
+        const ALIGN: usize = 1;
+        type Value<'buf> = &'buf [()];
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            place: *mut Self::Value<'buf>,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
+            unsafe {
+                let len = v.slice_len::<u8, _>(place)?;
+                v.slice_data(place, len)
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_schemas_do_not_invent_values() {
+        let values = FlatVec::<UnitSchema>::new();
+        assert_eq!(values.first(), None);
+        assert_eq!(values.iter().count(), 0);
+        let values = FlatVec::<NoopSchema>::default();
+        assert_eq!(values.first(), None);
+        assert_eq!(values.iter().count(), 0);
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "FlatVec schema encoded no bytes")
+    )]
+    fn test_zero_sized_scalar_encoding_debug_assert() {
+        FlatVec::<UnitSchema>::new().push(());
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "FlatVec schema encoded no bytes")
+    )]
+    fn test_noop_encoding_debug_assert() {
+        FlatVec::<NoopSchema>::new().push(());
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "FlatVec schema encoded no bytes")
+    )]
+    fn test_zero_byte_encoding_of_non_zero_sized_value_debug_assert() {
+        // A slice reference is not zero-sized, but its encoded payload is empty.
+        FlatVec::<EmptySliceSchema>::new().push(&[]);
+    }
+
+    #[test]
+    fn test_empty_encoding_leaves_vector_empty() {
+        let mut values = FlatVec::<UnitSchema>::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| values.push(())));
+        assert_eq!(result.is_err(), cfg!(debug_assertions));
+        assert_eq!(values.len, 0);
+        assert_eq!(values.first(), None);
+        assert_eq!(values.iter().count(), 0);
+    }
+
+    #[test]
+    fn test_zero_sized_values_with_metadata_are_supported() {
+        let mut values = FlatVec::<UnitWithMetadataSchema>::new();
+        for _ in 0..3 {
+            values.push(());
+        }
+        assert_eq!(values.first(), Some(()));
+        let mut iter = values.iter();
+        for _ in 0..3 {
+            assert_eq!(iter.next(), Some(()));
+        }
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_empty_and_zero_sized_slices_with_length_prefix_are_supported() {
+        let mut values = FlatVec::<UnitSliceSchema>::new();
+        values.push(&[]);
+        values.push(&[(); 3]);
+        let lengths: Vec<_> = values.iter().map(|value| value.len()).collect();
+        assert_eq!(lengths, [0, 3]);
+    }
 
     /// fixed-sized example
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -550,6 +712,94 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Padded {
+        prefix: u8,
+        value: u64,
+    }
+
+    struct PaddedSchema;
+
+    unsafe impl FlatVecSchema for PaddedSchema {
+        const ALIGN: usize = align_of::<Padded>();
+        type Value<'buf> = (Padded, &'buf [Padded], u8);
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            place: *mut Self::Value<'buf>,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
+            unsafe {
+                // Copy a padded scalar, then a slice of padded elements. The
+                // length prefix and trailing byte also create alignment gaps.
+                v.scalar(&raw mut (*place).0)?;
+                let items = &raw mut (*place).1;
+                let len = v.slice_len::<u16, _>(items)?;
+                v.slice_data(items, len)?;
+                v.scalar(&raw mut (*place).2)
+            }
+        }
+    }
+
+    #[test]
+    fn test_uninitialized_padding_survives_growth_and_typed_reads() {
+        assert!(size_of::<Padded>() > size_of::<u8>() + size_of::<u64>());
+        let mut flatvec = FlatVec::<PaddedSchema>::new();
+        for i in 0..20 {
+            let scalar = Padded {
+                prefix: i,
+                value: u64::from(i) * 10,
+            };
+            let items = [
+                scalar,
+                Padded {
+                    prefix: i + 1,
+                    value: u64::from(i) * 10 + 1,
+                },
+            ];
+            flatvec.push((scalar, &items, i));
+        }
+
+        // This type assertion guards the buffer boundary: exposing &[u8] here
+        // would wrongly promise initialized alignment and struct padding.
+        let encoded: &[MaybeUninit<u8>] = flatvec.as_slice();
+        assert_eq!(encoded.len(), flatvec.len);
+
+        let (scalar, items, suffix) = flatvec.first().unwrap();
+        assert_eq!(
+            scalar,
+            Padded {
+                prefix: 0,
+                value: 0
+            }
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(suffix, 0);
+        let mut count = 0;
+        for (i, (scalar, items, suffix)) in flatvec.iter().enumerate() {
+            assert_eq!(
+                scalar,
+                Padded {
+                    prefix: i as u8,
+                    value: i as u64 * 10
+                }
+            );
+            assert_eq!(
+                items,
+                &[
+                    scalar,
+                    Padded {
+                        prefix: i as u8 + 1,
+                        value: i as u64 * 10 + 1
+                    }
+                ]
+            );
+            assert_eq!(suffix, i as u8);
+            count += 1;
+        }
+        assert_eq!(count, 20);
     }
 
     #[test]
