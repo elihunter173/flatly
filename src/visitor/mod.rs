@@ -26,26 +26,25 @@ pub trait FlatVisitor<'buf> {
     /// ```
     unsafe fn scalar<T: Copy + 'static>(&mut self, place: *mut T) -> Result<(), FlatError>;
 
-    unsafe fn slice_len<L: FlatLen, T>(
-        &mut self,
-        place: *mut &'buf [T],
-    ) -> Result<usize, FlatError>;
-
-    /// Copies slice elements without retaining non-static source borrows.
+    /// Visits a length-prefixed slice without exposing its length to the schema.
+    ///
+    /// The length is encoded as `L`. Readers initialize the slice reference;
+    /// writers copy its elements without retaining non-static source borrows.
+    /// Alignment visitors account for both `L` and `T`, even for empty slices.
+    ///
     /// The slice itself may still borrow the buffer for `'buf`.
     ///
     /// ```compile_fail
     /// use flatly::visitor::{FlatError, FlatVisitor};
     /// unsafe fn borrowed_elements<'buf, V: FlatVisitor<'buf>>(
-    ///     visitor: &mut V, place: *mut &'buf [&'buf u64], len: usize,
+    ///     visitor: &mut V, place: *mut &'buf [&'buf u64],
     /// ) -> Result<(), FlatError> {
-    ///     unsafe { visitor.slice_data(place, len) }
+    ///     unsafe { visitor.slice::<u32, _>(place) }
     /// }
     /// ```
-    unsafe fn slice_data<T: Copy + 'static>(
+    unsafe fn slice<L: FlatLen, T: Copy + 'static>(
         &mut self,
         place: *mut &'buf [T],
-        len: usize,
     ) -> Result<(), FlatError>;
 }
 

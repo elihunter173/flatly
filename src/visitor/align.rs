@@ -27,19 +27,11 @@ impl<'buf> FlatVisitor<'buf> for AlignOfVisitor {
         Ok(())
     }
 
-    unsafe fn slice_len<L: FlatLen, T>(
+    unsafe fn slice<L: FlatLen, T: Copy + 'static>(
         &mut self,
         _place: *mut &'buf [T],
-    ) -> Result<usize, FlatError> {
-        self.include::<L>();
-        Ok(0)
-    }
-
-    unsafe fn slice_data<T: Copy + 'static>(
-        &mut self,
-        _place: *mut &'buf [T],
-        _len: usize,
     ) -> Result<(), FlatError> {
+        self.include::<L>();
         self.include::<T>();
         Ok(())
     }

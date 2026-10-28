@@ -16,7 +16,7 @@ use super::{FlatError, FlatLen, FlatVisitor};
 /// unsafe fn invent_static(reader: &mut ReadVisitor<'_>) -> &'static [u8] {
 ///     let mut out = MaybeUninit::<&'static [u8]>::uninit();
 ///     unsafe {
-///         reader.slice_data(out.as_mut_ptr(), 0).unwrap();
+///         reader.slice::<u32, _>(out.as_mut_ptr()).unwrap();
 ///         out.assume_init()
 ///     }
 /// }
@@ -65,26 +65,17 @@ impl<'buf> FlatVisitor<'buf> for ReadVisitor<'buf> {
         Ok(())
     }
 
-    unsafe fn slice_len<L: FlatLen, T>(
+    unsafe fn slice<L: FlatLen, T: Copy + 'static>(
         &mut self,
-        _place: *mut &'buf [T],
-    ) -> Result<usize, FlatError> {
+        place: *mut &'buf [T],
+    ) -> Result<(), FlatError> {
         let mut stored = MaybeUninit::<L>::uninit();
         unsafe {
             self.scalar(stored.as_mut_ptr())?;
-            stored
+            let len = stored
                 .assume_init()
                 .to_usize()
-                .ok_or(FlatError::LenOverflow)
-        }
-    }
-
-    unsafe fn slice_data<T: Copy + 'static>(
-        &mut self,
-        place: *mut &'buf [T],
-        len: usize,
-    ) -> Result<(), FlatError> {
-        unsafe {
+                .ok_or(FlatError::LenOverflow)?;
             let head = self.take_array::<T>(len)?;
             place.write(slice::from_raw_parts(head.as_ptr(), len));
         }

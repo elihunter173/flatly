@@ -50,30 +50,17 @@ impl<'buf> FlatVisitor<'buf> for WriteVisitor<'_> {
         Ok(())
     }
 
-    unsafe fn slice_len<L: FlatLen, T>(
+    unsafe fn slice<L: FlatLen, T: Copy + 'static>(
         &mut self,
         place: *mut &'buf [T],
-    ) -> Result<usize, FlatError> {
-        unsafe {
-            let len = place.read().len();
-            let mut stored = L::from_usize(len).ok_or(FlatError::LenOverflow)?;
-            self.scalar(&raw mut stored)?;
-            Ok(len)
-        }
-    }
-
-    unsafe fn slice_data<T: Copy + 'static>(
-        &mut self,
-        place: *mut &'buf [T],
-        len: usize,
     ) -> Result<(), FlatError> {
         unsafe {
-            let src: &[T] = place.read();
-            // Copying `len` elements out of `src` must never overrun it, even if the caller
-            // passed the wrong length.
-            assert_eq!(len, src.len(), "slice_data called with a mismatched len");
-            let dst = self.take_array::<T>(len)?;
-            dst.as_ptr().copy_from_nonoverlapping(src.as_ptr(), len);
+            let src = place.read();
+            let mut stored = L::from_usize(src.len()).ok_or(FlatError::LenOverflow)?;
+            self.scalar(&raw mut stored)?;
+            let dst = self.take_array::<T>(src.len())?;
+            dst.as_ptr()
+                .copy_from_nonoverlapping(src.as_ptr(), src.len());
         }
         Ok(())
     }

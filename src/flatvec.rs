@@ -63,15 +63,10 @@ use crate::visitor::{AlignOfVisitor, FlatError, FlatVisitor, ReadVisitor, WriteV
 ///
 /// # Safety
 ///
-/// `ALIGN` must be a valid allocation alignment and the maximum alignment used
-/// by the encoding. `visit` must visit every field, initializing a valid value on
-/// a successful read, and use the same encoding for every lifetime. Borrowed data
-/// must be visited through lifetime-bound slice operations, not copied as
-/// reference-valued scalars. Scalar and slice element types must be valid to copy
-/// into the buffer and back without retaining references to the original value.
+/// `visit` must initialize a valid value on a successful read. Successful traversals must use
+/// the same sequence of visitor operations and type parameters, independent of the value,
+/// lifetime, and visitor implementation. A traversal may terminate early on a visitor error.
 pub unsafe trait FlatVecSchema {
-    const ALIGN: usize;
-
     /// The value type, which may borrow from the encoded buffer for `'buf`.
     ///
     /// No `Self: 'buf` bound is needed: values borrow the buffer, not the schema.
@@ -80,12 +75,13 @@ pub unsafe trait FlatVecSchema {
     /// Visits every field in the encoded representation without reading from `place` directly.
     ///
     /// Implementations may form raw pointers to fields and pass them to the visitor, but must not
-    /// dereference `place` themselves.
+    /// dereference `place` themselves. Alignment discovery passes uninitialized storage and
+    /// only inspects the types supplied to visitor operations.
     ///
     /// # Safety
     ///
     /// `place` must be valid for the visitor's operations: writable storage for
-    /// a reader, or an initialized value for a writer.
+    /// a reader or alignment visitor, or an initialized value for a writer.
     unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
         place: *mut Self::Value<'buf>,
         v: &mut V,
@@ -127,7 +123,8 @@ impl<S: FlatVecSchema> Drop for FlatVec<S> {
     /// Frees the allocation, if there is one.
     fn drop(&mut self) {
         if self.capacity != 0 {
-            let layout = Layout::from_size_align(self.capacity, S::ALIGN).expect("invalid layout");
+            let layout =
+                Layout::from_size_align(self.capacity, Self::alignment()).expect("invalid layout");
             unsafe { alloc::dealloc(self.ptr.as_ptr(), layout) }
         }
     }
@@ -142,6 +139,16 @@ impl<S: FlatVecSchema> FlatVec<S> {
             capacity: 0,
             _marker: PhantomData,
         }
+    }
+
+    /// Computes the encoded alignment without storing it in the vector.
+    fn alignment() -> usize {
+        let mut visitor = AlignOfVisitor::new();
+        let mut place = MaybeUninit::<S::Value<'_>>::uninit();
+        // SAFETY: alignment visitation never reads or writes the supplied storage.
+        unsafe { S::visit(place.as_mut_ptr(), &mut visitor) }
+            .expect("alignment visitor never returns errors");
+        visitor.alignment()
     }
 
     /// Returns the encoded region (`0..len`), which may contain uninitialized padding.
@@ -181,14 +188,14 @@ impl<S: FlatVecSchema> FlatVec<S> {
             self.capacity.checked_mul(2).expect("capacity overflow")
         };
 
-        let new_layout = Layout::from_size_align(new_capacity, S::ALIGN).expect("invalid layout");
+        let alignment = Self::alignment();
+        let new_layout = Layout::from_size_align(new_capacity, alignment).expect("invalid layout");
 
         let new_ptr = if self.capacity == 0 {
             unsafe { alloc::alloc(new_layout) }
         } else {
-            // TODO: Realloc needs to preserve the alignment of the current buffer.
             let old_layout =
-                Layout::from_size_align(self.capacity, S::ALIGN).expect("invalid layout");
+                Layout::from_size_align(self.capacity, alignment).expect("invalid layout");
             unsafe { alloc::realloc(self.ptr.as_ptr(), old_layout, new_capacity) }
         };
 
@@ -219,14 +226,17 @@ impl<S: FlatVecSchema> FlatVec<S> {
     /// its [`FlatVecSchema`] impl stores it with. In debug builds, also panics if
     /// the schema successfully encodes a value without consuming any bytes.
     pub fn push(&mut self, mut v: S::Value<'_>) {
-        // Ensure S::ALIGN is right
+        // Check each value against the alignment discovered from the schema.
         if cfg!(debug_assertions) {
             let mut align_visitor = AlignOfVisitor::new();
             unsafe {
                 S::visit(&raw mut v, &mut align_visitor)
-                    .expect("align of visitor never returns errors")
+                    .expect("alignment visitor never returns errors")
             };
-            assert_eq!(S::ALIGN, align_visitor.alignment());
+            debug_assert!(
+                Self::alignment() == align_visitor.alignment(),
+                "FlatVec schema alignment changed between traversals"
+            );
         }
 
         loop {
@@ -310,7 +320,6 @@ mod tests {
     struct UnitSchema;
 
     unsafe impl FlatVecSchema for UnitSchema {
-        const ALIGN: usize = 1;
         type Value<'buf> = ();
 
         unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
@@ -324,7 +333,6 @@ mod tests {
     struct NoopSchema;
 
     unsafe impl FlatVecSchema for NoopSchema {
-        const ALIGN: usize = 1;
         type Value<'buf> = ();
 
         unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
@@ -338,21 +346,19 @@ mod tests {
     struct EmptySliceSchema;
 
     unsafe impl FlatVecSchema for EmptySliceSchema {
-        const ALIGN: usize = 1;
         type Value<'buf> = &'buf [u8];
 
         unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
             place: *mut Self::Value<'buf>,
             v: &mut V,
         ) -> Result<(), FlatError> {
-            unsafe { v.slice_data(place, 0) }
+            unsafe { v.slice::<u8, _>(place) }
         }
     }
 
     struct UnitWithMetadataSchema;
 
     unsafe impl FlatVecSchema for UnitWithMetadataSchema {
-        const ALIGN: usize = 1;
         type Value<'buf> = ();
 
         unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
@@ -370,17 +376,13 @@ mod tests {
     struct UnitSliceSchema;
 
     unsafe impl FlatVecSchema for UnitSliceSchema {
-        const ALIGN: usize = 1;
         type Value<'buf> = &'buf [()];
 
         unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
             place: *mut Self::Value<'buf>,
             v: &mut V,
         ) -> Result<(), FlatError> {
-            unsafe {
-                let len = v.slice_len::<u8, _>(place)?;
-                v.slice_data(place, len)
-            }
+            unsafe { v.slice::<u8, _>(place) }
         }
     }
 
@@ -413,13 +415,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        debug_assertions,
-        should_panic(expected = "FlatVec schema encoded no bytes")
-    )]
-    fn test_zero_byte_encoding_of_non_zero_sized_value_debug_assert() {
-        // A slice reference is not zero-sized, but its encoded payload is empty.
-        FlatVec::<EmptySliceSchema>::new().push(&[]);
+    fn test_empty_slice_encodes_length_prefix() {
+        let mut values = FlatVec::<EmptySliceSchema>::new();
+        values.push(&[]);
+        assert_eq!(values.len, 1);
+        assert_eq!(values.first(), Some(&[][..]));
+        assert_eq!(values.iter().count(), 1);
     }
 
     #[test]
@@ -466,7 +467,6 @@ mod tests {
     struct PointSchema;
 
     unsafe impl FlatVecSchema for PointSchema {
-        const ALIGN: usize = align_of::<Point>();
         type Value<'buf> = Point;
 
         unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
@@ -528,7 +528,6 @@ mod tests {
     struct MixedAlignmentSchema;
 
     unsafe impl FlatVecSchema for MixedAlignmentSchema {
-        const ALIGN: usize = align_of::<Overaligned>();
         type Value<'buf> = MixedAlignment;
 
         unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
@@ -542,6 +541,75 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    struct OveralignedSliceSchema;
+
+    unsafe impl FlatVecSchema for OveralignedSliceSchema {
+        type Value<'buf> = &'buf [Overaligned];
+
+        unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+            place: *mut Self::Value<'buf>,
+            v: &mut V,
+        ) -> Result<(), FlatError> {
+            unsafe { v.slice::<u8, _>(place) }
+        }
+    }
+
+    #[test]
+    fn test_overaligned_slices_including_empty_survive_growth() {
+        let mut values = FlatVec::<OveralignedSliceSchema>::new();
+        assert_eq!(FlatVec::<OveralignedSliceSchema>::alignment(), 64);
+        values.push(&[]);
+        let initial_capacity = values.capacity;
+        for i in 0..20 {
+            values.push(&[Overaligned(i)]);
+        }
+        assert!(values.capacity > initial_capacity);
+        assert_eq!(values.ptr.as_ptr().addr() % 64, 0);
+
+        let mut iter = values.iter();
+        let empty = iter.next().unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.as_ptr().addr() % 64, 0);
+        for i in 0..20 {
+            let slice = iter.next().unwrap();
+            assert_eq!(slice, &[Overaligned(i)]);
+            assert_eq!(slice.as_ptr().addr() % 64, 0);
+        }
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "FlatVec schema alignment changed between traversals")]
+    fn test_changed_schema_alignment_debug_assert() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static INCLUDE_ALIGNED: AtomicBool = AtomicBool::new(false);
+        struct ChangingSchema;
+
+        // Deliberately violates the traversal contract to exercise the debug check.
+        unsafe impl FlatVecSchema for ChangingSchema {
+            type Value<'buf> = (u8, Overaligned);
+
+            unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+                place: *mut Self::Value<'buf>,
+                v: &mut V,
+            ) -> Result<(), FlatError> {
+                unsafe {
+                    v.scalar(&raw mut (*place).0)?;
+                    if INCLUDE_ALIGNED.swap(true, Ordering::Relaxed) {
+                        v.scalar(&raw mut (*place).1)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        INCLUDE_ALIGNED.store(false, Ordering::Relaxed);
+        let mut values = FlatVec::<ChangingSchema>::new();
+        values.push((0, Overaligned(0)));
     }
 
     #[test]
@@ -572,7 +640,6 @@ mod tests {
     struct TagSchema;
 
     unsafe impl FlatVecSchema for TagSchema {
-        const ALIGN: usize = align_of::<f64>();
         type Value<'buf> = Tag<'buf>;
 
         unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
@@ -582,8 +649,7 @@ mod tests {
             unsafe {
                 // `&str` has the same layout as `&[u8]`.
                 let val = (&raw mut (*place).val).cast::<&'buf [u8]>();
-                let len = v.slice_len::<u32, _>(val)?;
-                v.slice_data(val, len)?;
+                v.slice::<u32, _>(val)?;
                 v.scalar(&raw mut (*place).ts)?;
             }
             Ok(())
@@ -694,7 +760,6 @@ mod tests {
     struct SeriesSchema;
 
     unsafe impl FlatVecSchema for SeriesSchema {
-        const ALIGN: usize = align_of::<Point>();
         type Value<'buf> = Series<'buf>;
 
         unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
@@ -705,8 +770,7 @@ mod tests {
                 TagSchema::visit(&raw mut (*place).name, v)?;
 
                 let points = &raw mut (*place).points;
-                let len = v.slice_len::<u16, _>(points)?;
-                v.slice_data(points, len)?;
+                v.slice::<u16, _>(points)?;
 
                 v.scalar(&raw mut (*place).flag)?;
             }
@@ -724,7 +788,6 @@ mod tests {
     struct PaddedSchema;
 
     unsafe impl FlatVecSchema for PaddedSchema {
-        const ALIGN: usize = align_of::<Padded>();
         type Value<'buf> = (Padded, &'buf [Padded], u8);
 
         unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
@@ -736,8 +799,7 @@ mod tests {
                 // length prefix and trailing byte also create alignment gaps.
                 v.scalar(&raw mut (*place).0)?;
                 let items = &raw mut (*place).1;
-                let len = v.slice_len::<u16, _>(items)?;
-                v.slice_data(items, len)?;
+                v.slice::<u16, _>(items)?;
                 v.scalar(&raw mut (*place).2)
             }
         }
