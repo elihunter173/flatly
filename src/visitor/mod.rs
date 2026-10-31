@@ -1,4 +1,5 @@
 mod align;
+mod measure;
 mod read;
 mod write;
 
@@ -6,13 +7,15 @@ mod write;
 mod tests;
 
 pub use align::AlignOfVisitor;
+pub use measure::MeasureVisitor;
 pub use read::ReadVisitor;
 pub use write::WriteVisitor;
 
 /// Traverses fields whose borrowed data has lifetime `'buf`.
 ///
-/// Readers may create references valid for `'buf`; writers and alignment visitors
-/// support any field lifetime independently of their own backing buffers.
+/// Readers may create references valid for `'buf`; writers, measurement visitors,
+/// and alignment visitors support any field lifetime independently of their own
+/// backing buffers.
 pub trait FlatVisitor<'buf> {
     /// Copies a scalar without retaining non-static source borrows.
     ///

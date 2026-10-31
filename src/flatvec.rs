@@ -10,7 +10,9 @@ use std::{
     slice,
 };
 
-use crate::visitor::{AlignOfVisitor, FlatError, FlatVisitor, ReadVisitor, WriteVisitor};
+use crate::visitor::{
+    AlignOfVisitor, FlatError, FlatVisitor, MeasureVisitor, ReadVisitor, WriteVisitor,
+};
 
 /// Defines a flat encoding and its value type for each buffer lifetime.
 ///
@@ -81,7 +83,8 @@ pub unsafe trait FlatVecSchema {
     /// # Safety
     ///
     /// `place` must be valid for the visitor's operations: writable storage for
-    /// a reader or alignment visitor, or an initialized value for a writer.
+    /// a reader or alignment visitor, or an initialized value for a writer or
+    /// measurement visitor.
     unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
         place: *mut Self::Value<'buf>,
         v: &mut V,
@@ -175,18 +178,22 @@ impl<S: FlatVecSchema> FlatVec<S> {
         }
     }
 
-    /// Grows the allocation to 8 bytes if nothing has been allocated yet,
-    /// otherwise to twice the current capacity.
+    /// Ensures `required` bytes fit, growing at least geometrically with a
+    /// single allocation or reallocation even for a large append.
     ///
     /// # Panics
     ///
-    /// Panics if the new capacity overflows `usize` or if the allocator returns null.
-    fn double(&mut self) {
-        let new_capacity = if self.capacity == 0 {
-            8
-        } else {
-            self.capacity.checked_mul(2).expect("capacity overflow")
-        };
+    /// Panics if the new layout is invalid or if the allocator returns null.
+    fn reserve(&mut self, required: usize) {
+        if required <= self.capacity {
+            return;
+        }
+        let new_capacity = self
+            .capacity
+            .checked_mul(2)
+            .unwrap_or(required)
+            .max(required)
+            .max(8);
 
         let alignment = Self::alignment();
         let new_layout = Layout::from_size_align(new_capacity, alignment).expect("invalid layout");
@@ -215,16 +222,18 @@ impl<S: FlatVecSchema> FlatVec<S> {
         self.len = new_len;
     }
 
-    /// Appends `v` to the back of `FlatVec`. If item doesn't fit, the buffer size is doubled.
+    /// Measures `v`, reserves sufficient capacity, and writes it once to the back
+    /// of `FlatVec`. Capacity grows at least geometrically when necessary.
     ///
     /// Borrowed data is copied into the buffer, so its input lifetime is independent
     /// of the vector and of the schema `S` used to select the encoding.
     ///
     /// # Panics
     ///
-    /// Panics if growing the buffer fails, or if a slice in `v` is too long for the length type
-    /// its [`FlatVecSchema`] impl stores it with. In debug builds, also panics if
-    /// the schema successfully encodes a value without consuming any bytes.
+    /// Panics if the encoded size overflows, growing the buffer fails, or a slice
+    /// in `v` is too long for its encoded length type. Measurement failures leave
+    /// the vector unchanged. In debug builds, also panics if the schema encodes
+    /// a value without consuming any bytes.
     pub fn push(&mut self, mut v: S::Value<'_>) {
         // Check each value against the alignment discovered from the schema.
         if cfg!(debug_assertions) {
@@ -239,26 +248,40 @@ impl<S: FlatVecSchema> FlatVec<S> {
             );
         }
 
-        loop {
-            let mut writer = WriteVisitor::from_uninit_bytes(self.spare_capacity_mut());
-            let start = writer.as_ptr();
-            // SAFETY: `v` is a live, initialized value; the write visitor only reads through it.
-            match unsafe { S::visit(&raw mut v, &mut writer) } {
-                Ok(()) => {
-                    debug_assert!(writer.as_ptr() != start, "FlatVec schema encoded no bytes");
-                    let written = writer.as_ptr().addr().get() - start.addr().get();
-                    let new_len = self.len + written;
-                    unsafe { self.set_len(new_len) };
-                    break;
-                }
-                Err(FlatError::InsufficientSpace) => {
-                    self.double();
-                }
-                Err(FlatError::LenOverflow) => {
-                    panic!("slice length doesn't fit in its stored length type");
-                }
+        // The allocation base is aligned for every encoded field, so its byte
+        // offset gives the same padding as the writer's absolute cursor address.
+        let mut measure = MeasureVisitor::from_offset(self.len);
+        // SAFETY: `v` is initialized; measurement only reads slice lengths.
+        match unsafe { S::visit(&raw mut v, &mut measure) } {
+            Ok(()) => {}
+            Err(FlatError::InsufficientSpace) => panic!("encoded size overflow"),
+            Err(FlatError::LenOverflow) => {
+                panic!("slice length doesn't fit in its stored length type");
             }
         }
+        let size = measure.size();
+        debug_assert!(size != 0, "FlatVec schema encoded no bytes");
+        if size == 0 {
+            // Zero-byte encodings are not tracked as elements.
+            return;
+        }
+        let new_len = self.len.checked_add(size).expect("encoded size overflow");
+        self.reserve(new_len);
+
+        let mut writer = WriteVisitor::from_uninit_bytes(&mut self.spare_capacity_mut()[..size]);
+        let start = writer.as_ptr();
+        // SAFETY: `v` is initialized and the measured encoding fits in spare
+        // storage. The writer copies borrowed data without modifying `v`.
+        unsafe { S::visit(&raw mut v, &mut writer) }
+            .expect("FlatVec schema write failed after successful measurement");
+        let written = writer.as_ptr().addr().get() - start.addr().get();
+        assert_eq!(
+            written, size,
+            "FlatVec schema size changed between measurement and write"
+        );
+        // SAFETY: every measured byte now belongs to a complete encoding;
+        // alignment gaps and typed padding may remain uninitialized.
+        unsafe { self.set_len(new_len) };
     }
 
     /// Returns the first element, or `None` if the vector is empty.
@@ -505,6 +528,83 @@ mod tests {
 
         let collected: Vec<Point> = flatvec.iter().collect();
         assert_eq!(collected, points);
+    }
+
+    #[test]
+    fn test_measured_appends_write_once_and_preserve_unaligned_row_offsets() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static WRITES: AtomicUsize = AtomicUsize::new(0);
+        struct CountedSchema;
+
+        unsafe impl FlatVecSchema for CountedSchema {
+            type Value<'buf> = (&'buf [u8], u64, u8);
+
+            unsafe fn visit<'buf, V: FlatVisitor<'buf>>(
+                place: *mut Self::Value<'buf>,
+                v: &mut V,
+            ) -> Result<(), FlatError> {
+                // Instrument traversal without changing the encoding for any visitor.
+                if std::any::type_name::<V>() == std::any::type_name::<WriteVisitor<'_>>() {
+                    WRITES.fetch_add(1, Ordering::Relaxed);
+                }
+                unsafe {
+                    v.slice::<u16, _>(&raw mut (*place).0)?;
+                    v.scalar(&raw mut (*place).1)?;
+                    v.scalar(&raw mut (*place).2)
+                }
+            }
+        }
+
+        WRITES.store(0, Ordering::Relaxed);
+        let mut values = FlatVec::<CountedSchema>::new();
+        values.push((b"abc", 1, 10));
+        assert_eq!(WRITES.load(Ordering::Relaxed), 1);
+        assert_eq!(values.len % align_of::<u64>(), 1);
+
+        let large = vec![42; 32_768];
+        values.push((&large, 2, 20));
+        assert_eq!(WRITES.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            [(&b"abc"[..], 1, 10), (&large[..], 2, 20),]
+        );
+
+        // An invalid length is rejected before reserving or writing anything,
+        // including when earlier elements have already been committed.
+        let previous = (values.ptr, values.len, values.capacity);
+        let too_long = vec![0; 65_536];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            values.push((&too_long, 999, 99));
+        }));
+        assert!(result.is_err());
+        assert_eq!((values.ptr, values.len, values.capacity), previous);
+        assert_eq!(WRITES.load(Ordering::Relaxed), 2);
+
+        values.push((b"last", 3, 30));
+        assert_eq!(WRITES.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            [
+                (&b"abc"[..], 1, 10),
+                (&large[..], 2, 20),
+                (&b"last"[..], 3, 30),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_invalid_first_append_does_not_allocate() {
+        let mut values = FlatVec::<UnitSliceSchema>::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            values.push(&[(); 256]);
+        }));
+        assert!(result.is_err());
+        assert_eq!(values.capacity, 0);
+        assert_eq!(values.len, 0);
+        assert_eq!(values.first(), None);
+        values.push(&[(); 3]);
+        assert_eq!(values.first().unwrap().len(), 3);
     }
 
     #[test]
